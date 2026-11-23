@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "cfg.h"
+#include "game_profile.h"
 #include "host.h"
 #include "vk.h"
 #include "platform/platform.h"
@@ -69,7 +70,7 @@ void rdoc_init(void) {
     char full[PLAT_PATH_MAX], tmpl[PLAT_PATH_MAX + 16];
     if (!plat_full_path(dir && *dir ? dir : "build/captures", full, sizeof full)) return;
     plat_file_mkdir_p(full);
-    snprintf(tmpl, sizeof tmpl, "%s/totk", full);
+    snprintf(tmpl, sizeof tmpl, "%s/%s", full, game_profile()->short_name);
     api->SetCaptureFilePathTemplate(tmpl);
     rt_log("rdoc: ready, %d frame(s), captures %s", n_targets, full);
 }

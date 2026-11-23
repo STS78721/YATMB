@@ -17,6 +17,7 @@
 #include "cfg.h"
 #include "fs.h"
 #include "gfx.h"
+#include "kernel.h"
 #include "nvn_api.h"
 #include "ov.h"
 #include "platform/platform.h"
@@ -61,9 +62,14 @@ static void check_npdm(void) {
     memcpy(&stack, npdm + 0x1C, 4);
     int prio = npdm[0xE], core = npdm[0xF];
     free(npdm);
-    if (prio != 44 || core != 0 || stack != 0x100000)
-        rt_fatal("boot: main.npdm asks for priority %d, core %d, stack %#x; kernel.c builds 44, 0, 0x100000", prio,
-                 core, stack);
+    if (rt_game_version) {
+        if (prio != 44 || core != 0 || stack != 0x100000)
+            rt_fatal("boot: main.npdm asks for priority %d, core %d, stack %#x; kernel.c builds 44, 0, 0x100000", prio,
+                     core, stack);
+    } else {
+        rt_log("boot: main.npdm priority=%d core=%d stack=%#x", prio, core, stack);
+        kern_configure_main(prio, core, stack);
+    }
 }
 
 // ---- the three callbacks of nn::init::Start (rtld's job on hardware)

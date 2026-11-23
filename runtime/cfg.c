@@ -174,7 +174,7 @@ static const CfgMeta metas[] = {
     {"DUALSENSE_HAPTICS", "1", "0|1", LIVE},
     {"STICK_DEADZONE", "8", "0..50", LIVE}, {"MOUSE_SENS", "1", "0..10", LIVE},
     {"MENU_LANG", "", "en|ru", LIVE},
-    {"MENU_THEME", "tennis", "tennis|light|dark", LIVE},
+    {"MENU_THEME", "", "storybook|tennis|light|dark", LIVE},
     // Advanced: scheduling
     {"ASYNC_PREEMPT", "1", "0|1|2", RESTART}, {"REPLAY_ASYNC", "0", "0|1", RESTART},
     {"FREE_CORES", "0", "0|1", RESTART}, {"TIMER_1MS", "1", "0|1", RESTART}, {"REC_BATCH", "0", "0..64", RESTART},
@@ -233,6 +233,7 @@ static char *trim(char *s) {
 static const char *unprefix(const char *name) {
     if (!name) return NULL;
     if (!strncmp(name, "NS2_", 4)) return name + 4;
+    if (!strncmp(name, "YATMB_", 6)) return name + 6;
     if (!strncmp(name, "FF_", 3)) return name + 3;
     if (!strncmp(name, "MTF_", 4)) return name + 4;
     if (!strncmp(name, "MKW_", 4)) return name + 4;
@@ -254,7 +255,7 @@ static void add(char *key, char *value, int line) {
     size_t vl = strlen(value);
     if (vl >= 2 && value[0] == '"' && value[vl - 1] == '"') value[vl - 1] = 0, value++;
     if (!*key) return;
-    if (!is_known(key)) rt_log("cfg: dkb.ini line %d: unknown key '%s'", line, key);
+    if (!is_known(key)) rt_log("cfg: %s line %d: unknown key '%s'", game_profile()->ini_name, line, key);
     if (!*value) return;   // "key =" leaves the setting at its default
     for (int i = 0; i < n_entries; i++)
         if (!strcmp(entries[i].key, key)) {   // a repeated key: the later line wins
@@ -279,7 +280,7 @@ int cfg_load(const char *path) {
         char *s = trim(p);
         char *eq = strchr(s, '=');
         if (*s && *s != '#' && *s != ';' && *s != '[') {
-            if (!eq) rt_log("cfg: dkb.ini line %d: no '=' in '%s'", line, s);
+            if (!eq) rt_log("cfg: %s line %d: no '=' in '%s'", game_profile()->ini_name, line, s);
             else {
                 *eq = 0;
                 add(trim(s), trim(eq + 1), line);
@@ -347,7 +348,7 @@ static const char *dkb_alias(const char *name) {
     char alias[96];
     const char *u = unprefix(name);
     if (!u || strlen(u) >= sizeof alias - 6) return NULL;
-    static const char *const kPrefixes[] = {"NS2", "FF", "MTF", "MKW", "DKB", "OOT", "TOTK"};
+    static const char *const kPrefixes[] = {"NS2", "YATMB", "FF", "MTF", "MKW", "DKB", "OOT", "TOTK"};
     for (size_t i = 0; i < sizeof kPrefixes / sizeof *kPrefixes; i++) {
         snprintf(alias, sizeof alias, "%s_%s", kPrefixes[i], u);
         const char *e = getenv(alias);
@@ -565,7 +566,7 @@ static void put(Out *o, const char *s, size_t n) {
     if (o->n + n + 1 > o->cap) {
         o->cap = (o->n + n + 1) * 2;
         o->buf = realloc(o->buf, o->cap);
-        if (!o->buf) rt_fatal("cfg: out of memory writing dkb.ini");
+        if (!o->buf) rt_fatal("cfg: out of memory writing %s", game_profile()->ini_name);
     }
     memcpy(o->buf + o->n, s, n);
     o->n += n;
@@ -613,7 +614,7 @@ int cfg_save_to(const char *path) {
     // after[i]: entries to write after line i (-1 = none); replace[i]: the entry whose value line i now carries
     int *replace = malloc(sizeof(int) * ((size_t)nl + 1)), *after_key = malloc(sizeof(int) * (size_t)(n + 1));
     char *drop = calloc((size_t)nl + 1, 1);   // lines of a reset key
-    if (!lines || !replace || !after_key || !drop) rt_fatal("cfg: out of memory writing dkb.ini");
+    if (!lines || !replace || !after_key || !drop) rt_fatal("cfg: out of memory writing %s", game_profile()->ini_name);
     for (int i = 0, at = 0; i < nl; i++) {
         size_t start = (size_t)at;
         while ((uint64_t)at < size && text[at] != '\n') at++;
@@ -758,13 +759,13 @@ static void load_ini(void) {
     for (int i = 0; i < n_entries; i++) {
         char var[128];
         snprintf(var, sizeof var, PREFIX "%s", entries[i].key);
-        if (env_of(var)) rt_log("cfg: %s (or its DKB_ name) is set in the environment and overrides dkb.ini", var);
+        if (env_of(var)) rt_log("cfg: %s is set in the environment and overrides %s", entries[i].key, game_profile()->ini_name);
     }
 }
 
 void cfg_init(void) {
     load_ini();
     if (profile_of())
-        rt_log("cfg: device profile Steam Deck: defaults for the keys dkb.ini does not set (DKB_DEVICE_PROFILE=desktop "
-               "turns it off)");
+        rt_log("cfg: device profile Steam Deck: defaults for the keys %s does not set (NS2_DEVICE_PROFILE=desktop "
+               "turns it off)", game_profile()->ini_name);
 }

@@ -159,15 +159,18 @@ static void ov_performance_mode(Cpu *c) { ret_x(c, ov_handheld() ? 0 : 1); }
 static void ov_get_default_display_resolution(Cpu *c) {
     int32_t *w = (int32_t *)arg_p(c, 0);
     int32_t *h = (int32_t *)arg_p(c, 1);
+    int32_t rw, rh;
     if (ov_handheld()) {
-        if (w) *w = (int32_t)game_profile()->handheld_w;
-        if (h) *h = (int32_t)game_profile()->handheld_h;
-        return;
+        rw = (int32_t)game_profile()->handheld_w;
+        rh = (int32_t)game_profile()->handheld_h;
+    } else {
+        unsigned want[2] = {0, 0};
+        res_display_size(want);
+        rw = (int32_t)(want[0] ? want[0] : game_profile()->docked_w);
+        rh = (int32_t)(want[1] ? want[1] : game_profile()->docked_h);
     }
-    unsigned want[2] = {0, 0};
-    res_display_size(want);
-    if (w) *w = (int32_t)(want[0] ? want[0] : game_profile()->docked_w);
-    if (h) *h = (int32_t)(want[1] ? want[1] : game_profile()->docked_h);
+    if (w) *w = rw;
+    if (h) *h = rh;
 }
 
 static void ov_display_resolution_change_event(Cpu *c) {
@@ -374,6 +377,11 @@ static void ov_aoc_list(Cpu *c) {
     if (n && !(out && plat_mem_readable((uintptr_t)out, n * sizeof *out))) n = 0;   // nothing written, nothing reported
     for (uint32_t i = 0; i < n; i++) out[i] = (int32_t)ids[i];
     ret_x(c, n);
+}
+static void ov_aoc_list_changed_event(Cpu *c) {
+    uint64_t ev = arg_x(c, 0);
+    if (!ev) rt_fatal("nn::aoc::GetAddOnContentListChangedEvent: null event");
+    kern_bind_system_event(c, ev, 0);
 }
 static void ov_err_context(Cpu *c) { (void)c; rt_log("err: error contexts stay local"); }
 static void ov_pctl_initialize(Cpu *c) { (void)c; rt_log("pctl: no parental controls"); }
@@ -1170,6 +1178,15 @@ static void ov_sock_eventfd_rw(Cpu *c) {
 // ignores anything above 2. The host is a docked console with the most to give, so the highest value. Unverified
 // against hardware: what the three levels mean is not known.
 static void ov_graphics_scale(Cpu *c) {
+    if (game_profile_has(GAME_QUIRK_GRAPHICS_SCALE_ZERO)) {
+        if (!ov_handheld()) {
+            ret_x(c, 0);
+            return;
+        }
+        int pct = atoi(cfg_value("NS2_RENDER_SCALE"));
+        ret_x(c, (pct > 0 && pct <= 67) ? 2 : (pct > 0 && pct <= 80) ? 1 : 0);
+        return;
+    }
     if (!ov_handheld()) {
         ret_x(c, 2);
         return;
@@ -1251,6 +1268,8 @@ HOST_OVERRIDE("nndiagStartup", ov_diag_startup);
 HOST_OVERRIDE("_ZN2nn3aoc10InitializeEv", ov_aoc_initialize);
 HOST_OVERRIDE("_ZN2nn3aoc17CountAddOnContentEv", ov_aoc_count);
 HOST_OVERRIDE("_ZN2nn3aoc16ListAddOnContentEPiii", ov_aoc_list);
+HOST_OVERRIDE("_ZN2nn3aoc31GetAddOnContentListChangedEventEPNS_2os11SystemEventE", ov_aoc_list_changed_event);
+HOST_OVERRIDE("_ZN2nn3aoc37GetAddOnContentListChangedEventLegacyEPNS_2os11SystemEventE", ov_aoc_list_changed_event);
 HOST_OVERRIDE("_ZN2nn3err26InitializeContextWriterApiEv", ov_err_context);
 HOST_OVERRIDE("_ZN2nn4pctl10InitializeEv", ov_pctl_initialize);
 HOST_OVERRIDE("_ZN2nn4diag34InitializeApplicationAbortObserverEv", ov_abort_observer);
@@ -1427,6 +1446,7 @@ HOST_OVERRIDE("_ZN2nn2ro18RegisterModuleInfoEPNS0_16RegistrationInfoEPKvj", ov_r
 HOST_OVERRIDE("_ZN2nn2ro20UnregisterModuleInfoEPNS0_16RegistrationInfoE", ov_ret_zero);
 HOST_OVERRIDE("_ZN2nn2ro10LoadModuleEPNS0_6ModuleEPKvPvmi", ov_ro_load_module);
 HOST_OVERRIDE("_ZN2nn2ro10LoadModuleEPNS0_6ModuleEPKvPvmib", ov_ro_load_module);
+HOST_OVERRIDE("_ZN2nn2ro12UnloadModuleEPNS0_6ModuleE", ov_ret_zero);
 HOST_OVERRIDE("_ZN2nn2pl17RequestLoadNxFontEPvm", ov_noop);
 HOST_OVERRIDE("_ZN2nn5prepo10PlayReport4SendERKNS_7account3UidE", ov_report_send);
 HOST_OVERRIDE("_ZN2nn5prepo12AsyncContext18GetCompletionEventEPNS_2os11SystemEventE", ov_async_event);
@@ -1444,7 +1464,12 @@ static void ov_nsa_available(Cpu *c) {
     if (out) *out = 0;
     ret_x(c, 0);
 }
+static void ov_account_cancelled(Cpu *c) {
+    ret_x(c, (100u << 9) | 124u);   // nn::account::ResultCancelledByUser
+}
 HOST_OVERRIDE("_ZN2nn7account32IsNetworkServiceAccountAvailableEPbRKNS0_10UserHandleE", ov_nsa_available);
+HOST_OVERRIDE("_ZN2nn7account34IsUserRegistrationRequestPermittedEPb", ov_nsa_available);
+HOST_OVERRIDE("_ZN2nn7account15ShowUserCreatorEv", ov_account_cancelled);
 
 static void ov_account_async_ctor(Cpu *c) {
     uint64_t *ctx = arg_p(c, 0);
@@ -1839,9 +1864,14 @@ static void ov_app_error(Cpu *c) {
 HOST_OVERRIDE("_ZN2nn2oe17GetPseudoDeviceIdEPNS_4util4UuidE", ov_pseudo_device_id);
 HOST_OVERRIDE("_ZN2nn2oe17EnableCrashReportEv", ov_noop);
 HOST_OVERRIDE("_ZN2nn2oe18DisableCrashReportEv", ov_noop);
+HOST_OVERRIDE("_ZN2nn2oe16EnableScreenShotEv", ov_noop);
+HOST_OVERRIDE("_ZN2nn2oe17DisableScreenShotEv", ov_noop);
 HOST_OVERRIDE("_ZN2nn2oe24GetServerEnvironmentTypeEv", ov_ret_zero);
 HOST_OVERRIDE("_ZN2nn2oe40SendServerMaintenanceOverlayNotificationENS_4time9PosixTimeES2_", ov_noop);
 HOST_OVERRIDE("_ZN2nn3err20ShowApplicationErrorERKNS0_19ApplicationErrorArgE", ov_app_error);
+HOST_OVERRIDE("_ZN2nn3aoc8FinalizeEv", ov_noop);
+HOST_OVERRIDE("_ZN2nn3aoc16UpdateCachedListEv", ov_noop);
+HOST_OVERRIDE("_ZN2nn3aoc28CheckAddOnContentMountStatusEv", ov_noop);
 HOST_OVERRIDE("_ZN2nn3aoc25ShowAddOnContentLostErrorEPKii", ov_noop);
 HOST_OVERRIDE("_ZN2nn4pctl25TryBeginFreeCommunicationEb", ov_ret_one);
 HOST_OVERRIDE("_ZN2nn4pctl20EndFreeCommunicationEv", ov_noop);
@@ -1850,6 +1880,8 @@ HOST_OVERRIDE("_ZN2nn5album10InitializeEv", ov_ret_zero);
 HOST_OVERRIDE("_ZN2nn5album8FinalizeEv", ov_noop);
 HOST_OVERRIDE("_ZN2nn5album14SaveScreenshotEPKvmNS0_9ImageSizeENS0_17AlbumReportOptionE", ov_bcat_unavailable);
 HOST_OVERRIDE("_ZN2nn3nfp7UnmountERKNS0_12DeviceHandleE", ov_nfp_no_device);
+HOST_OVERRIDE("_ZN2nn3nfp5MountERKNS0_12DeviceHandleENS0_9ModelTypeE", ov_nfp_no_device);
+HOST_OVERRIDE("_ZN2nn3nfp13GetCommonInfoEPNS0_10CommonInfoERKNS0_12DeviceHandleE", ov_nfp_no_device);
 HOST_OVERRIDE("_ZN2nn7account29LoadCachedNintendoAccountInfoEPNS0_25CachedNintendoAccountInfoERKNS0_10UserHandleEPvm", ov_cached_account_info);
 
 // nn::time timezone rules & async network clock task

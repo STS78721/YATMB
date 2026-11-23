@@ -1,0 +1,42 @@
+# Yoshi and the Mysterious Book PC (SteelTemple YATMB) — example / safe defaults
+# Hardware-agnostic baseline. Do not ship a personal yatmb.ini in releases.
+# Players can raise internal resolution (720p/900p/1080p/1440p/2160p), fullscreen,
+# upscaling, and visual preferences in-game (F1) or in YATMBLauncher after install.
+
+[paths]
+exefs = ./exefs
+romfs = ./romfs_packed
+
+[display]
+window_size = 1920x1080
+output_res = 1920x1080
+fullscreen = 0
+upscaler = fsr
+sharpness = 80
+fg_mode = off
+vk_present = mailbox
+perf_overlay = off
+color_preset = default
+
+[graphics]
+# original = Switch 2 baseline; also supports 720, 900, 1080, 1440, 2160 (native 4K)
+resolution = original
+aniso = 16
+
+[frame rate]
+fps_limit = 60
+
+[input]
+pad_layout = auto
+stick_deadzone = 8
+
+[audio]
+volume = 100
+
+[language]
+menu_theme = storybook
+
+[performance]
+replay_async = 0
+pipe_skip = any
+pipe_prebuild = 1

@@ -10,12 +10,13 @@ extern const char rt_game_short_name[] __attribute__((weak));
 extern const char rt_game_display_name[] __attribute__((weak));
 
 static const RtGameProfile kProfiles[] = {
-    {0x040074a01bf12000ull, "dkb",  "Donkey Kong Bananza",                "dkb.ini",  1920, 1080, 1280, 720, GAME_QUIRK_PT_BR},
-    {0x0400C3F00006E000ull, "mkw",  "Mario Kart World",                   "mkw.ini",  1920, 1080, 1280, 720, GAME_QUIRK_MKW_HEAP_FALLBACK | GAME_QUIRK_MKW_VTABLES},
-    {0x0400D4201C6EA000ull, "mtf",  "Mario Tennis Fever",                 "mtf.ini",  1920, 1080, 1280, 720, GAME_QUIRK_MTF_WORKER_ARGS | GAME_QUIRK_NO_RU},
-    {0x040041E0212AE000ull, "ff",   "Fast Fusion",                        "ff.ini",   1920, 1080, 1280, 720, GAME_QUIRK_NONE},
-    {0x0100F2C0115B6000ull, "totk", "Zelda: Tears of the Kingdom",        "totk.ini", 1920, 1080, 1280, 720, GAME_QUIRK_TOTK_PATCH_RES},
-    {0x0400486024DEC000ull, "oot",  "Zelda: Ocarina of Time (Switch 2)",  "oot.ini",  1920, 1080, 1280, 720, GAME_QUIRK_NONE},
+    {0x040074a01bf12000ull, "dkb",  "Donkey Kong Bananza",                "dkb.ini",  "dark",      1920, 1080, 1280, 720, GAME_QUIRK_PT_BR},
+    {0x0400C3F00006E000ull, "mkw",  "Mario Kart World",                   "mkw.ini",  "dark",      1920, 1080, 1280, 720, GAME_QUIRK_MKW_HEAP_FALLBACK | GAME_QUIRK_MKW_VTABLES},
+    {0x0400D4201C6EA000ull, "mtf",  "Mario Tennis Fever",                 "mtf.ini",  "tennis",    1920, 1080, 1280, 720, GAME_QUIRK_MTF_WORKER_ARGS | GAME_QUIRK_NO_RU},
+    {0x040041E0212AE000ull, "ff",   "Fast Fusion",                        "ff.ini",   "dark",      1920, 1080, 1280, 720, GAME_QUIRK_NONE},
+    {0x0100F2C0115B6000ull, "totk", "Zelda: Tears of the Kingdom",        "totk.ini", "dark",      1920, 1080, 1280, 720, GAME_QUIRK_TOTK_PATCH_RES},
+    {0x0400486024DEC000ull, "oot",  "Zelda: Ocarina of Time (Switch 2)",  "oot.ini",  "dark",      1920, 1080, 1280, 720, GAME_QUIRK_NONE},
+    {0x0400245021D2C000ull, "yatmb","Yoshi and the Mysterious Book",      "yatmb.ini","storybook", 1920, 1080, 1280, 720, GAME_QUIRK_RTLD_ORDER | GAME_QUIRK_GRAPHICS_SCALE_ZERO | GAME_QUIRK_UE5_CVAR_RES},
 };
 
 static RtGameProfile g_resolved;
@@ -39,6 +40,7 @@ const RtGameProfile *game_profile(void) {
         .short_name = sn,
         .display_name = dn,
         .ini_name = g_ini_buf,
+        .default_menu_theme = "dark",
         .docked_w = 1920,
         .docked_h = 1080,
         .handheld_w = 1280,

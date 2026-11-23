@@ -8,6 +8,7 @@
 #include <time.h>
 
 #include "cfg.h"
+#include "game_profile.h"
 #include "host.h"
 #include "vk.h"
 #include "platform/platform.h"
@@ -80,8 +81,10 @@ static int create_instance(void) {
     }
     if (utils) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     g_vk.debug_utils = utils;
-    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "TotK Recomp",
-                             .pEngineName = "TotK Recomp", .apiVersion = VK_API_VERSION_1_3};
+    const char *app_name = game_profile()->display_name;
+    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+                             .pApplicationName = (app_name && *app_name) ? app_name : "Universal NS2-to-PC",
+                             .pEngineName = "Universal NS2-to-PC", .apiVersion = VK_API_VERSION_1_3};
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
                                .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext,
                                .enabledLayerCount = validate ? 1 : 0, .ppEnabledLayerNames = layers};
@@ -554,7 +557,8 @@ void vk_device_fault_report(VkResult r) {
         char path[PLAT_PATH_MAX * 3 + 48];
         const char *cut = lp ? strrchr(lp, '/') : NULL;
         if (cut) {
-            snprintf(path, sizeof path, "%.*s/dkb-fault-%llu.bin", (int)(cut - lp), lp, (unsigned long long)time(NULL));
+            snprintf(path, sizeof path, "%.*s/%s-fault-%llu.bin", (int)(cut - lp), lp, game_profile()->short_name,
+                     (unsigned long long)time(NULL));
             if (plat_file_write_atomic(path, bin, (size_t)n.vendorBinarySize))
                 rt_log("vk: device fault binary saved: %s (%llu bytes)", path, (unsigned long long)n.vendorBinarySize);
             else rt_log("vk: device fault binary: cannot write %s", path);

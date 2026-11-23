@@ -154,7 +154,9 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
 }
 
 // ---- Asynchronous replay
-enum { RI_SUBMIT, RI_PRESENT, RI_RELEASE, RI_WRITE_BACK };
+enum { RI_SUBMIT, RI_PRESENT, RI_RELEASE, RI_WRITE_BACK, RI_TEX_REG, RI_SAMP_REG };
+typedef struct { dpool_ref pool; int id, has_view; tex_t tex; view_t view; } TexRegCopy;
+typedef struct { dpool_ref pool; int id; samp_par samp; } SampRegCopy;
 typedef struct {
     int kind, n, has_crop, crop[4];
     uint64_t value, submit_no, at, queued, submitted_ticks;
@@ -162,18 +164,22 @@ typedef struct {
     VkUsnap *usnap;
     const tex_t *tex;   // RI_RELEASE: a copy the item owns (the game may reuse the object's memory)
                         // RI_WRITE_BACK: at is the guest address, queued the size
+    void *reg;          // RI_TEX_REG: TexRegCopy *; RI_SAMP_REG: SampRegCopy * (owned, freed on replay)
 } ReplayItem;
-#define RQ_CAP 1024   // a frame queues 1 submit and 1 present, and up to a few hundred releases
-enum { DR_POOL_FINI, DR_MAP_VIRTUAL, DR_TEX_RELEASE, DR_PROG_RELEASE, DR_FINISH, DR_READ_TEXELS, DR_WRITE_TEXELS,
-       DR_GUEST_READ, DR_FRAME, DR_FULL, DR_CHECK, DR_N };
+#define RQ_CAP 8192   // submissions, presents, releases and descriptor registrations for up to a frame ahead
+enum { DR_POOL_FINI, DR_MAP_VIRTUAL, DR_TEX_REG, DR_SAMP_REG, DR_TEX_RELEASE, DR_PROG_RELEASE, DR_FINISH, DR_READ_TEXELS,
+       DR_WRITE_TEXELS, DR_GUEST_READ, DR_FRAME, DR_FULL, DR_CHECK, DR_N };
 static const char *const dr_name[DR_N] = {
-    "pool_fini", "map_virtual", "texture_release (queued)", "program_release", "finish", "read_texels (writer fence)",
-    "write_texels", "guest_read (writer fence)", "frame bound", "queue full", "check drain"};
+    "pool_fini", "map_virtual", "texture_register (queued)", "sampler_register (queued)", "texture_release (queued)",
+    "program_release", "finish", "read_texels (writer fence)", "write_texels", "guest_read (writer fence)",
+    "frame bound", "queue full", "check drain"};
 
 static PlatMutex rl = PLAT_MUTEX_INIT;
 static PlatCond rcv = PLAT_COND_INIT;   // item queued, item taken, item done
 static ReplayItem rq[RQ_CAP];
 static int rq_head, rq_n, r_busy, r_started;
+static volatile int r_cur_kind;
+static volatile uint64_t r_cur_val;
 static uint64_t r_presents_queued, r_presents_done, r_submit_done, game_frames;
 static uint64_t r_items_queued, r_items_done;   // every item, for replay_drain
 // Under rl: calls, calls that waited and the time waited per cause, since the last replay_log line and over the run.
@@ -223,6 +229,8 @@ static void replay_main(void *arg) {
         r_busy = 1;
         plat_cond_broadcast(&rcv);
         plat_mutex_unlock(&rl);
+        __atomic_store_n(&r_cur_kind, it.kind + 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&r_cur_val, it.value, __ATOMIC_RELAXED);
         if (it.kind == RI_SUBMIT) {
             vk_usnap_install(it.usnap);
             uint64_t f = submit_sync(it.h, it.n, it.submitted_ticks);
@@ -237,10 +245,19 @@ static void replay_main(void *arg) {
             vk_present_drain();
             vk_texture_release(it.tex);
             free((void *)it.tex);
+        } else if (it.kind == RI_TEX_REG) {
+            TexRegCopy *c = it.reg;
+            vk_texture_register(&c->pool, c->id, &c->tex, c->has_view ? &c->view : NULL);
+            free(c);
+        } else if (it.kind == RI_SAMP_REG) {
+            SampRegCopy *c = it.reg;
+            vk_sampler_register(&c->pool, c->id, &c->samp);
+            free(c);
         } else {
             uint64_t frame = __atomic_add_fetch(&gfx_counters.frames, 1, __ATOMIC_RELAXED);
             present_image(it.tex, it.has_crop ? it.crop : NULL, it.at, it.queued, frame, it.value);
         }
+        __atomic_store_n(&r_cur_kind, 0, __ATOMIC_RELAXED);
         plat_mutex_lock(&rl);
         if (it.kind == RI_SUBMIT) r_submit_done = it.submit_no;
         else if (it.kind == RI_PRESENT) r_presents_done++;
@@ -290,7 +307,7 @@ static uint64_t replay_enqueue(ReplayItem *it) {
         wait_counted(DR_FULL, p0);
         core_back_unlocked(&away);
     }
-    it->value = it->kind == RI_RELEASE || it->kind == RI_WRITE_BACK ? 0 : vk_sync_reserve();   // these signal nothing
+    it->value = (it->kind == RI_SUBMIT || it->kind == RI_PRESENT) ? vk_sync_reserve() : 0;   // only submits and presents signal
     rq[(rq_head + rq_n) % RQ_CAP] = *it;
     rq_n++;
     r_items_queued++;
@@ -389,8 +406,51 @@ static int vk_be_pool_map_virtual(pool_t *v, int n, const void *requests) {
     vk_present_drain();
     return vk_pool_map_virtual(v, n, requests);
 }
-static void vk_be_texture_register(const dpool_ref *pool, int id, const tex_t *t, const view_t *v) { vk_sync_start(); vk_texture_register(pool, id, t, v); }
-static void vk_be_sampler_register(const dpool_ref *pool, int id, const samp_par *s) { vk_sync_start(); vk_sampler_register(pool, id, s); }
+// Asynchronous: descriptor pool slot updates are queued behind earlier submissions so reusing a texture or sampler
+// slot for a transient render target or view on the next frame cannot overwrite the descriptor an earlier queued
+// submission still resolves during replay. Both the descriptor and any view are copied because the guest may reuse
+// their memory as soon as Register* returns.
+static void vk_be_texture_register(const dpool_ref *pool, int id, const tex_t *t, const view_t *v) {
+    vk_sync_start();
+    if (!gfx_replay_async()) {
+        vk_texture_register(pool, id, t, v);
+        return;
+    }
+    if (!pool || id < 0 || id >= (1 << 20) || (uint32_t)id >= pool->count)
+        rt_fatal("vk: texture slot %d out of pool range", id);
+    TexRegCopy *copy = malloc(sizeof *copy);
+    if (!copy) rt_fatal("vk: out of memory (replay queue)");
+    copy->pool = *pool;
+    copy->id = id;
+    copy->tex = *t;
+    copy->has_view = v != NULL;
+    if (v) copy->view = *v;
+    else memset(&copy->view, 0, sizeof copy->view);
+    ReplayItem it = {.kind = RI_TEX_REG, .reg = copy};
+    plat_mutex_lock(&rl);
+    dr_calls[DR_TEX_REG]++, dr_tcalls[DR_TEX_REG]++;
+    plat_mutex_unlock(&rl);
+    replay_enqueue(&it);
+}
+static void vk_be_sampler_register(const dpool_ref *pool, int id, const samp_par *s) {
+    vk_sync_start();
+    if (!gfx_replay_async()) {
+        vk_sampler_register(pool, id, s);
+        return;
+    }
+    if (!pool || id < 0 || id >= (1 << 12) || (uint32_t)id >= pool->count)
+        rt_fatal("vk: sampler slot %d out of pool range", id);
+    SampRegCopy *copy = malloc(sizeof *copy);
+    if (!copy) rt_fatal("vk: out of memory (replay queue)");
+    copy->pool = *pool;
+    copy->id = id;
+    copy->samp = *s;
+    ReplayItem it = {.kind = RI_SAMP_REG, .reg = copy};
+    plat_mutex_lock(&rl);
+    dr_calls[DR_SAMP_REG]++, dr_tcalls[DR_SAMP_REG]++;
+    plat_mutex_unlock(&rl);
+    replay_enqueue(&it);
+}
 // Asynchronous: the release is queued behind the submissions before it, so their replay still resolves the texture's
 // slots to its image (a released slot follows another live texture at the storage), and the ones after it see it
 // released, the order of the synchronous replay. vk_texture_release reads only the object's key fields: a copy.
@@ -624,6 +684,17 @@ const GfxBackend gfx_vulkan_backend = {
     .guest_read = vk_be_guest_read,
     .cpu_synced = vk_be_cpu_synced,
 };
+
+void vk_diag_report(void) {
+    vk_crumbs_report();
+    rt_log("vk: diag: frames=%llu sync_issued=%llu sync_done=%llu replay_queued=%llu replay_done=%llu "
+           "rq_n=%d r_busy=%d r_cur_kind=%d r_cur_val=%llu pres_q=%llu pres_d=%llu pres_pend=%d pres_busy=%d",
+           (unsigned long long)game_frames, (unsigned long long)vk_sync_issued(),
+           (unsigned long long)vk_sync_fence_done(), (unsigned long long)r_items_queued,
+           (unsigned long long)r_items_done, rq_n, r_busy, __atomic_load_n(&r_cur_kind, __ATOMIC_RELAXED),
+           (unsigned long long)__atomic_load_n(&r_cur_val, __ATOMIC_RELAXED),
+           (unsigned long long)r_presents_queued, (unsigned long long)r_presents_done, pending, busy);
+}
 
 void vk_backend_shutdown(void) {
     replay_drain(DR_FINISH);

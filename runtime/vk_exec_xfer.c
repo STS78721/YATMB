@@ -550,7 +550,7 @@ static void copy_buffer_image(VkExec *ex, const p_copy_b2t *p, int to_image) {
     }
     ex->recorded++;
     if (to_image) {
-        if (written) vk_texture_gpu_written(p->tex);
+        if (written) vk_texture_gpu_written_level(p->tex, s.level);
     } else {
         vk_mem_gpu_wrote(&m, size), note_gpu_write(ex, p->src, size);
     }
@@ -621,7 +621,7 @@ static int copy_decoded_astc(VkExec *ex, const p_copy_t2t *p) {
     VkImageCopy cp = {sub_layers(&s), sub_offset(&s), sub_layers(&d), sub_offset(&d), sub_extent(&s)};
     vkCmdCopyImage(ex->cb, si->image, VK_IMAGE_LAYOUT_GENERAL, di->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
     ex->recorded++;
-    vk_texture_gpu_written(p->dst);
+    vk_texture_gpu_written_level(p->dst, d.level);
     return 1;
 }
 
@@ -632,7 +632,15 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
     if (!sub_resolve(p->dst, &p->dv, p->has_dv, &p->dr, 1, 2, &d)) return;
     d.nz = s.nz;
     int same_size = s.w == d.w && s.h == d.h;
-    int same_format = s.img->format == d.img->format;
+    VkFormat sf = s.img->format, df = d.img->format;
+    TexVkFormat vf;
+    if (p->has_sv && p->sv.set_format && tex_vk_format(p->sv.format, &vf) && vf.vk == vf.ideal) sf = vf.vk;
+    if (p->has_dv && p->dv.set_format && tex_vk_format(p->dv.format, &vf) && vf.vk == vf.ideal) df = vf.vk;
+    int srgb_alias = (s.img->format == VK_FORMAT_R8G8B8A8_UNORM && d.img->format == VK_FORMAT_R8G8B8A8_SRGB) ||
+                     (s.img->format == VK_FORMAT_R8G8B8A8_SRGB && d.img->format == VK_FORMAT_R8G8B8A8_UNORM) ||
+                     (s.img->format == VK_FORMAT_B8G8R8A8_UNORM && d.img->format == VK_FORMAT_B8G8R8A8_SRGB) ||
+                     (s.img->format == VK_FORMAT_B8G8R8A8_SRGB && d.img->format == VK_FORMAT_B8G8R8A8_UNORM);
+    int same_format = s.img->format == d.img->format || (srgb_alias && sf == df);
     if (s.img->samples != d.img->samples && !(s.img->samples > 1 && d.img->samples == 1 && same_size && same_format)) {
         warn_once(W_COPY, "texture copy between %u and %u samples: skipped", s.img->samples, d.img->samples);
         return;
@@ -679,7 +687,7 @@ static void copy_t2t(VkExec *ex, const p_copy_t2t *p) {
                        linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
     ex->recorded++;
-    vk_texture_gpu_written(p->dst);
+    vk_texture_gpu_written_level(p->dst, d.level);
 }
 
 // ---- buffer to buffer
@@ -803,7 +811,7 @@ static void clear_tex(VkExec *ex, const p_clear_tex *p) {
         vkCmdBeginRendering(ex->cb, &ri);
         vkCmdEndRendering(ex->cb);
         ex->recorded += 2;
-        vk_texture_gpu_written(t);
+        vk_texture_gpu_written_level(t, s.level);
         return;
     }
     if (s.x || s.y || s.w != lw || s.h != lh || (p->mask & 0xf) != 0xf || reformat || partial_3d) {
@@ -835,7 +843,7 @@ static void clear_tex(VkExec *ex, const p_clear_tex *p) {
             vk_exec_mark_depth_cleared(img, rng.baseArrayLayer, rng.layerCount);
     }
     ex->recorded++;
-    vk_texture_gpu_written(t);
+    vk_texture_gpu_written_level(t, s.level);
 }
 
 void vk_exec_op_xfer(VkExec *ex, uint32_t op, const void *payload) {

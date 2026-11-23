@@ -77,7 +77,7 @@ static void *grow(void *p, int *cap, size_t elem) {
 
 // ---- resources of one command buffer, freed by its completion callback
 
-typedef struct { VkBuffer buf; VmaAllocation alloc; uint8_t *map; uint64_t size, used; } Chunk;
+typedef struct { VkBuffer buf; VmaAllocation alloc; uint8_t *map; uint64_t size, used, flushed; } Chunk;
 typedef struct {
     VkImage image;
     VkFormat format;
@@ -95,6 +95,8 @@ typedef struct {
     int nwritten, cwritten;
     uint32_t *written_slot;              // note_written: open-addressed index of written, entry = index + 1, 0 empty
     uint32_t written_slots;              // a power of two
+    VkBufferView *bviews;
+    int nbviews, cbviews;
 } CbRes;
 
 static CbRes *cur;
@@ -162,7 +164,7 @@ typedef struct { int cls, use; uint64_t bytes; } RsCount;
 static struct {
     int on;                              // TOTK_BIND_SKIP: 1 skip (default), 2 check, 0 off
     uint32_t hn;                         // words of h the last signature filled; 0: none
-    uint64_t h[32];                      // generations, descriptor tables, feedback images, support inputs, base instance
+    uint64_t h[64];                      // generations, descriptor tables, feedback images, support inputs, base instance
     const VkPipeInfo *info;              // the pipeline whose RsList ranges body holds, as of bind op generation gen
     uint64_t gen;
     uint8_t body[RS_BYTES];
@@ -180,9 +182,9 @@ static struct {
 // handles. sup and c0: the support inputs and the base instance count too. p: storage buffers whose address the shader
 // loads from a user uniform block; the address read from the block counts too. ok 0: never skipped (too many
 // descriptors or such buffers).
-#define RS_PTRS 4
+#define RS_PTRS 32
 typedef struct { uint32_t off, len; } RsRange;
-typedef struct { int st; const GfxShaderRes *res; } RsPtr;
+typedef struct { int st; const GfxShaderRes *res; int tex; } RsPtr;   // tex: a texture handle (ubo_handle)
 typedef struct { uint32_t n, bytes; uint8_t sup, c0, ok, np; RsPtr p[RS_PTRS]; RsRange r[]; } RsList;
 static nvn_hmap rs_lists;                // VkPipeInfo pointer -> RsList, until shutdown
 static const VkPipeInfo *rs_last;        // the last lookup
@@ -195,6 +197,8 @@ static void cb_done(void *arg) {   // completion thread
     CbRes *r = arg;
     VkCtx *c = vk_ctx();
     for (int i = 0; i < r->nwritten; i++) vk_gpu_written(r->written[i].addr, r->written[i].size);
+    for (int i = 0; i < r->nbviews; i++) vkDestroyBufferView(c->device, r->bviews[i], NULL);
+    free(r->bviews);
     for (int i = 0; i < r->npools; i++) {
         vkResetDescriptorPool(c->device, r->pools[i], 0);
         plat_mutex_lock(&spare_lock);
@@ -208,12 +212,31 @@ static void cb_done(void *arg) {   // completion thread
         int kept = r->chunks[i].size == CHUNK_BYTES && nspare_chunk < SPARE_CHUNKS;
         if (kept) spare_chunk[nspare_chunk++] = r->chunks[i];
         plat_mutex_unlock(&spare_lock);
-        if (!kept) vmaDestroyBuffer(c->vma, r->chunks[i].buf, r->chunks[i].alloc);
+        if (!kept) {
+            vk_exec_buffer_gone(r->chunks[i].buf);
+            vmaDestroyBuffer(c->vma, r->chunks[i].buf, r->chunks[i].alloc);
+        }
     }
     free(r->written), free(r->written_slot), free(r->pools), free(r->chunks), free(r);
 }
 
 void vk_exec_draw_new_cb(void) { memset(&B, 0, sizeof B); }
+
+// Flush host writes to transient scratch chunks before submission (a no-op on HOST_COHERENT memory).
+// Only touches the CbRes owned by the active recording `fence`, and clears `cur` when the submission ends so
+// completion-thread cb_done can never leave a dangling pointer.
+void vk_exec_draw_flush(uint64_t fence, int done) {
+    if (!cur || cur_fence != fence) return;
+    VmaAllocator vma = vk_ctx()->vma;
+    for (int i = 0; i < cur->nchunks; i++) {
+        Chunk *c = &cur->chunks[i];
+        if (c->used > c->flushed) {
+            vmaFlushAllocation(vma, c->alloc, c->flushed, c->used - c->flushed);
+            c->flushed = c->used;
+        }
+    }
+    if (done) cur = NULL, cur_fence = 0;
+}
 
 static CbRes *cb_res(VkExec *ex) {
     if (cur && cur_fence == ex->fence) return cur;
@@ -225,11 +248,13 @@ static CbRes *cb_res(VkExec *ex) {
     return cur;
 }
 
-static uint8_t *scratch(VkExec *ex, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
+static uint8_t *scratch_aligned(VkExec *ex, uint64_t size, uint64_t align, VkBuffer *buf, VkDeviceSize *off) {
+    if (align < 256) align = 256;
     CbRes *r = cb_res(ex);
     size = (size + 255) & ~255ull;
     Chunk *c = r->nchunks ? &r->chunks[r->nchunks - 1] : NULL;
-    if (!c || c->used + size > c->size) {
+    uint64_t start = c ? ((c->used + align - 1) / align) * align : 0;
+    if (!c || start + size > c->size) {
         if (r->nchunks == r->cchunks) r->chunks = grow(r->chunks, &r->cchunks, sizeof *r->chunks);
         c = &r->chunks[r->nchunks];
         uint64_t n = size > CHUNK_BYTES ? size : CHUNK_BYTES;
@@ -241,6 +266,7 @@ static uint8_t *scratch(VkExec *ex, uint64_t size, VkBuffer *buf, VkDeviceSize *
         }
         if (reused) {
             c->used = 0;
+            c->flushed = 0;
             r->nchunks++;
             *buf = c->buf;
             *off = 0;
@@ -250,20 +276,34 @@ static uint8_t *scratch(VkExec *ex, uint64_t size, VkBuffer *buf, VkDeviceSize *
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = n,
                                  .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
-        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
-                                      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                          VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT};
+        // Prefer host-visible device-local (ReBAR) memory for GPU-read transient buffers (c0, support, UBOs, IBs),
+        // cleanly falling back to host memory on GPUs without ReBAR or when the BAR aperture is full.
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+                                      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                               VMA_ALLOCATION_CREATE_MAPPED_BIT};
         VmaAllocationInfo info;
         VkResult res = vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &c->buf, &c->alloc, &info);
+        if (res != VK_SUCCESS) {
+            ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+            ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+            res = vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &c->buf, &c->alloc, &info);
+        }
         if (res != VK_SUCCESS) rt_fatal("vk: transient buffer of %llu bytes failed (%d)", (unsigned long long)n, (int)res);
-        c->map = info.pMappedData, c->size = n, c->used = 0;
+        c->map = info.pMappedData, c->size = n, c->used = 0, c->flushed = 0;
         r->nchunks++;
+        start = 0;
     }
     *buf = c->buf;
-    *off = c->used;
-    uint8_t *p = c->map + c->used;
-    c->used += size;
+    *off = start;
+    uint8_t *p = c->map + start;
+    c->used = start + size;
     return p;
+}
+
+static uint8_t *scratch(VkExec *ex, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
+    return scratch_aligned(ex, size, 256, buf, off);
 }
 
 static uint32_t written_hash(uint64_t addr, uint64_t size) {
@@ -454,6 +494,85 @@ static VkImageView storage_dummy(int di, int code) {
     return Z.img[di].sview;
 }
 
+static struct { int used; VkFormat fmt; VkFormatFeatureFlags feats; VkBufferView view; } BD[32];
+
+static VkBufferView zbuf_view_for(const GfxShaderRes *r, int storage) {
+    VkFormat fmt = (r && r->format > 0 && r->format < 40) ? tex_format[r->format] : VK_FORMAT_UNDEFINED;
+    if (fmt == VK_FORMAT_UNDEFINED || fmt == VK_FORMAT_R32G32B32A32_SFLOAT) return Z.zview;
+    VkFormatFeatureFlags need = storage ? VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT
+                                        : VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT;
+    for (int i = 0; i < 32 && BD[i].used; i++) {
+        if (BD[i].fmt == fmt) return (BD[i].feats & need) == need ? BD[i].view : Z.zview;
+    }
+    VkCtx *c = vk_ctx();
+    VkFormatProperties fp;
+    vkGetPhysicalDeviceFormatProperties(c->phys, fmt, &fp);
+    if ((fp.bufferFeatures & need) != need) return Z.zview;
+    for (int i = 0; i < 32; i++) {
+        if (!BD[i].used) {
+            VkBufferViewCreateInfo bv = {.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = Z.zbuf,
+                                         .format = fmt, .range = ZERO_BYTES};
+            if (vkCreateBufferView(c->device, &bv, NULL, &BD[i].view) != VK_SUCCESS) return Z.zview;
+            BD[i].used = 1, BD[i].fmt = fmt, BD[i].feats = fp.bufferFeatures;
+            return BD[i].view;
+        }
+    }
+    return Z.zview;
+}
+
+typedef struct { VkBuffer buf; VkFormat fmt; uint64_t off, range; } BViewKey;
+typedef struct BViewNode { struct BViewNode *next; BViewKey k; VkBufferView view; } BViewNode;
+static PlatMutex bview_lock = PLAT_MUTEX_INIT;
+static nvn_hmap bview_of;
+static nvn_hmap bviews_by_buf;
+
+static VkBufferView get_bview(VkBuffer buf, VkFormat fmt, uint64_t off, uint64_t range) {
+    BViewKey k = {buf, fmt, off, range};
+    plat_mutex_lock(&bview_lock);
+    if (!bview_of.klen) nvn_hm_init(&bview_of, sizeof(BViewKey)), nvn_hm_init(&bviews_by_buf, sizeof(VkBuffer));
+    VkBufferView view = (VkBufferView)nvn_hm_get(&bview_of, &k);
+    if (!view) {
+        VkBufferViewCreateInfo bv = {.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = buf,
+                                     .format = fmt, .offset = off, .range = range};
+        if (vkCreateBufferView(vk_ctx()->device, &bv, NULL, &view) != VK_SUCCESS) {
+            plat_mutex_unlock(&bview_lock);
+            return VK_NULL_HANDLE;
+        }
+        BViewNode *n = malloc(sizeof *n);
+        if (!n) rt_fatal("vk: out of memory");
+        *n = (BViewNode){nvn_hm_get(&bviews_by_buf, &buf), k, view};
+        nvn_hm_put(&bviews_by_buf, &buf, n);
+        nvn_hm_put(&bview_of, &k, (void *)view);
+    }
+    plat_mutex_unlock(&bview_lock);
+    return view;
+}
+
+void vk_exec_buffer_gone(VkBuffer buf) {
+    if (!buf) return;
+    plat_mutex_lock(&bview_lock);
+    if (!bviews_by_buf.klen) {
+        plat_mutex_unlock(&bview_lock);
+        return;
+    }
+    for (BViewNode *n = nvn_hm_del(&bviews_by_buf, &buf), *next; n; n = next) {
+        next = n->next;
+        nvn_hm_del(&bview_of, &n->k);
+        vk_defer_buffer_view(n->view);
+        free(n);
+    }
+    plat_mutex_unlock(&bview_lock);
+}
+
+static void bview_node_list_free(void *p) {
+    VkCtx *c = vk_ctx();
+    for (BViewNode *n = p, *next; n; n = next) {
+        next = n->next;
+        if (c && n->view) vkDestroyBufferView(c->device, n->view, NULL);
+        free(n);
+    }
+}
+
 static void dummies_init(void) {
     if (Z.ready) return;
     VkCtx *c = vk_ctx();
@@ -500,6 +619,12 @@ void vk_exec_draw_shutdown(void) {
         vmaDestroyImage(c->vma, SD[i].image, SD[i].alloc);
     }
     memset(SD, 0, sizeof SD);
+    for (int i = 0; i < 32 && BD[i].used; i++) vkDestroyBufferView(c->device, BD[i].view, NULL);
+    memset(BD, 0, sizeof BD);
+    plat_mutex_lock(&bview_lock);
+    if (bviews_by_buf.klen) nvn_hm_clear(&bviews_by_buf, bview_node_list_free);
+    if (bview_of.klen) nvn_hm_clear(&bview_of, NULL);
+    plat_mutex_unlock(&bview_lock);
     nvn_hm_clear(&rs_lists, free);
     rs_last = NULL, rs_last_l = NULL;
     for (int i = 0; i < nspare_pool; i++) vkDestroyDescriptorPool(c->device, spare_pool[i], NULL);
@@ -740,6 +865,7 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
             }
     }
     uint32_t swz = (uint32_t)sw[0] | (uint32_t)sw[1] << 8 | (uint32_t)sw[2] << 16 | (uint32_t)sw[3] << 24;
+    if (storage) swz |= 0x80000000u;
     ViewKey k = {img->image, fmt, vt, aspect, l0, nl, y0, ny, swz};
     if (!view_of.klen) nvn_hm_init(&view_of, sizeof(ViewKey)), nvn_hm_init(&views_by_image, sizeof(VkImage));
     VkImageView found = (VkImageView)nvn_hm_get(&view_of, &k);
@@ -753,8 +879,8 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
                                                                 : (img->usage & ~VK_IMAGE_USAGE_STORAGE_BIT)};
     // Restrict view usage for block-view BC images, sampled views over STORAGE images (sRGB views lack STORAGE_IMAGE_BIT),
     // or format-reinterpreted storage views (e.g. R32_UINT over R8G8B8A8_SRGB, where SAMPLED/ATTACHMENT bits may be invalid).
-    if (img->block_views || (!storage && (img->usage & VK_IMAGE_USAGE_STORAGE_BIT))) ci.pNext = &use;
-    else if (storage && fmt != img->format) {
+    if (!storage && (img->block_views || (img->usage & VK_IMAGE_USAGE_STORAGE_BIT))) ci.pNext = &use;
+    else if (storage && (img->block_views || fmt != img->format)) {
         use.usage = VK_IMAGE_USAGE_STORAGE_BIT;
         ci.pNext = &use;
     }
@@ -949,11 +1075,18 @@ static void slot_mask_learn(uint64_t serial, int st, const GfxShader *s) {
     slotm[slotm_idx(serial, st)] = (typeof(slotm[0])){serial, st, gfx_shader_slot_mask(s)};
 }
 
-static uint8_t type_of_handle(const VkExec *ex, uint64_t h) {   // texture lock held
+static uint8_t type_of_handle(const VkExec *ex, uint64_t h, int storage) {   // texture lock held
     view_t v;
     int hv;
     const VkTexImage *img = h ? vk_texture_by_id_locked(&ex->tex_pool, (int)(h & 0xfffff), &v, &hv) : NULL;
-    return img ? (uint8_t)gfx_type_of(img, &v, hv) : 0;
+    if (img) return (uint8_t)gfx_type_of(img, &v, hv);
+    VkFormat bfmt = VK_FORMAT_UNDEFINED;
+    if (h && (vk_texture_buffer_desc_locked(&ex->tex_pool, (int)(h & 0xfffff), NULL, NULL, &bfmt, NULL, storage) ||
+              (storage && vk_texture_buffer_desc_locked(&ex->tex_pool, (int)(h & 0xfffff), NULL, NULL, &bfmt, NULL, 0)))) {
+        int nt = vk_fmt_num_type(bfmt);
+        return (uint8_t)(GFX_TEX_BUFFER | (nt == GFX_TYPE_UINT ? GFX_TEX_UINT : nt == GFX_TYPE_SINT ? GFX_TEX_SINT : 0));
+    }
+    return 0;
 }
 
 // The answers of stage st for the slots in mask; the types of other slots stay zero.
@@ -990,13 +1123,13 @@ static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, G
         int imiss = c->img[slot] != hi || !c->itok[slot] || !slot_still(ex, &c->igen[slot], c->itok[slot], hi, gen);
         uint64_t tt = tmiss ? token_of(ex, h) : 0, it = imiss ? token_of(ex, hi) : 0;
         if ((tmiss || imiss || check) && !locked) vk_texture_lock(), locked = 1, BS.ac_miss++;
-        if (tmiss) c->tt[slot] = type_of_handle(ex, h), c->tex[slot] = h, c->ttok[slot] = tt, c->tgen[slot] = gen;
+        if (tmiss) c->tt[slot] = type_of_handle(ex, h, 0), c->tex[slot] = h, c->ttok[slot] = tt, c->tgen[slot] = gen;
         if (imiss) {
-            uint8_t full = type_of_handle(ex, hi);
+            uint8_t full = type_of_handle(ex, hi, 1);
             c->it[slot] = full & GFX_TEX_MASK, c->inum[slot] = full & (GFX_TEX_UINT | GFX_TEX_SINT);
             c->img[slot] = hi, c->itok[slot] = it, c->igen[slot] = gen;
         }
-        if (check && (type_of_handle(ex, h) != c->tt[slot] || (type_of_handle(ex, hi) & GFX_TEX_MASK) != c->it[slot]))   // TOTK_SHADER_MEMO=check
+        if (check && (type_of_handle(ex, h, 0) != c->tt[slot] || (type_of_handle(ex, hi, 1) & GFX_TEX_MASK) != c->it[slot]))   // TOTK_SHADER_MEMO=check
             rt_fatal("vk_exec: kept texture types of stage %d slot %d differ from a lookup", st, slot);
         a->tex_type[slot] = c->tt[slot], a->img_type[slot] = c->it[slot];
     }
@@ -1060,7 +1193,7 @@ static const uint8_t *native_gs_control(const uint8_t *ctl, const uint8_t *code,
 static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pending, int await);
 
 static const GfxShader *shader_with_int_img(VkExec *ex, int st, const GfxShader *base) {
-    if (!base || !ex->prog || !gfx_shader_is_prepared(base)) return base;
+    if (!base || !ex->prog) return base;
     const GfxShaderRes *lists[2] = {NULL, NULL};
     int counts[2] = {
         gfx_shader_resources(base, GFX_RES_IMG, &lists[0]),
@@ -1074,39 +1207,42 @@ static const GfxShader *shader_with_int_img(VkExec *ex, int st, const GfxShader 
         c->context = descriptor_serial;
     }
     uint32_t gen = vk_texture_slots_gen();
-    uint64_t umask = 0, smask = 0;
+    uint64_t umask[GFX_IMG_MASK_WORDS] = {0}, smask[GFX_IMG_MASK_WORDS] = {0};
     uint32_t miss_img = 0, miss_tex = 0;
     uint64_t img_tok[32] = {0}, tex_tok[32] = {0};
-    uint64_t img_bind[32] = {0}, tex_bind[32] = {0};
+    uint64_t img_bind[32][GFX_IMG_MASK_WORDS] = {{0}}, tex_bind[32][GFX_IMG_MASK_WORDS] = {{0}};
     int hi_n = 0;
-    struct { uint64_t h; uint8_t binding; } hi[64];
+    struct { uint64_t h; uint16_t binding; uint8_t storage; } hi[256];
     for (int p = 0; p < 2; p++) {
         for (int i = 0; i < counts[p]; i++) {
             const GfxShaderRes *r = &lists[p][i];
-            if (r->binding >= 64) continue;
+            if (r->binding >= GFX_IMG_MASK_WORDS * 64) continue;
+            uint32_t bw = r->binding >> 6;
+            uint64_t bb = 1ull << (r->binding & 63);
             uint32_t cnt = r->count ? r->count : 1;
             int cap = p == 0 ? 32 : 128;
             for (uint32_t k = 0; k < cnt; k++) {
                 int slot = r->slot + (int)k;
-                if (slot < 0 || slot >= cap) continue;
-                uint64_t h = p == 0 ? ex->img[st][slot] : ex->tex[st][slot];
+                int ubo_h = !k && vk_exec_ubo_handle_res(r);
+                uint64_t h = ubo_h ? vk_exec_ubo_handle(ex, st, r)
+                                   : (slot >= 0 && slot < cap ? (p == 0 ? ex->img[st][slot] : ex->tex[st][slot]) : 0);
                 if (!h) continue;
-                if (slot < 32) {
+                if (!ubo_h && slot >= 0 && slot < 32) {
                     int hit = p == 0 ? (c->img[slot] == h && c->itok[slot] && slot_still(ex, &c->igen[slot], c->itok[slot], h, gen))
                                      : (c->tex[slot] == h && c->ttok[slot] && slot_still(ex, &c->tgen[slot], c->ttok[slot], h, gen));
                     if (hit) {
                         uint8_t num = (p == 0 ? c->inum[slot] : c->tt[slot]) & (GFX_TEX_UINT | GFX_TEX_SINT);
-                        if (num == GFX_TEX_UINT) umask |= 1ull << r->binding;
-                        else if (num == GFX_TEX_SINT) smask |= 1ull << r->binding;
+                        if (num == GFX_TEX_UINT) umask[bw] |= bb;
+                        else if (num == GFX_TEX_SINT) smask[bw] |= bb;
                     } else if (p == 0) {
                         if (!(miss_img >> slot & 1u)) img_tok[slot] = token_of(ex, h), miss_img |= 1u << slot;
-                        img_bind[slot] |= 1ull << r->binding;
+                        img_bind[slot][bw] |= bb;
                     } else {
                         if (!(miss_tex >> slot & 1u)) tex_tok[slot] = token_of(ex, h), miss_tex |= 1u << slot;
-                        tex_bind[slot] |= 1ull << r->binding;
+                        tex_bind[slot][bw] |= bb;
                     }
-                } else if (hi_n < 64) {
-                    hi[hi_n].h = h, hi[hi_n].binding = (uint8_t)r->binding, hi_n++;
+                } else if (hi_n < 256) {
+                    hi[hi_n].h = h, hi[hi_n].binding = (uint16_t)r->binding, hi[hi_n].storage = (uint8_t)(p == 0), hi_n++;
                 }
             }
         }
@@ -1116,28 +1252,33 @@ static const GfxShader *shader_with_int_img(VkExec *ex, int st, const GfxShader 
         for (uint32_t m = miss_img; m; m &= m - 1) {
             int slot = __builtin_ctz(m);
             uint64_t h = ex->img[st][slot];
-            uint8_t full = type_of_handle(ex, h), num = full & (GFX_TEX_UINT | GFX_TEX_SINT);
+            uint8_t full = type_of_handle(ex, h, 1), num = full & (GFX_TEX_UINT | GFX_TEX_SINT);
             c->it[slot] = full & GFX_TEX_MASK, c->inum[slot] = num;
             c->img[slot] = h, c->itok[slot] = img_tok[slot], c->igen[slot] = gen;
-            if (num == GFX_TEX_UINT) umask |= img_bind[slot];
-            else if (num == GFX_TEX_SINT) smask |= img_bind[slot];
+            if (num == GFX_TEX_UINT) for (int w = 0; w < GFX_IMG_MASK_WORDS; w++) umask[w] |= img_bind[slot][w];
+            else if (num == GFX_TEX_SINT) for (int w = 0; w < GFX_IMG_MASK_WORDS; w++) smask[w] |= img_bind[slot][w];
         }
         for (uint32_t m = miss_tex; m; m &= m - 1) {
             int slot = __builtin_ctz(m);
             uint64_t h = ex->tex[st][slot];
-            uint8_t full = type_of_handle(ex, h), num = full & (GFX_TEX_UINT | GFX_TEX_SINT);
+            uint8_t full = type_of_handle(ex, h, 0), num = full & (GFX_TEX_UINT | GFX_TEX_SINT);
             c->tt[slot] = full, c->tex[slot] = h, c->ttok[slot] = tex_tok[slot], c->tgen[slot] = gen;
-            if (num == GFX_TEX_UINT) umask |= tex_bind[slot];
-            else if (num == GFX_TEX_SINT) smask |= tex_bind[slot];
+            if (num == GFX_TEX_UINT) for (int w = 0; w < GFX_IMG_MASK_WORDS; w++) umask[w] |= tex_bind[slot][w];
+            else if (num == GFX_TEX_SINT) for (int w = 0; w < GFX_IMG_MASK_WORDS; w++) smask[w] |= tex_bind[slot][w];
         }
         for (int i = 0; i < hi_n; i++) {
-            uint8_t num = type_of_handle(ex, hi[i].h) & (GFX_TEX_UINT | GFX_TEX_SINT);
-            if (num == GFX_TEX_UINT) umask |= 1ull << hi[i].binding;
-            else if (num == GFX_TEX_SINT) smask |= 1ull << hi[i].binding;
+            uint8_t num = type_of_handle(ex, hi[i].h, hi[i].storage) & (GFX_TEX_UINT | GFX_TEX_SINT);
+            uint32_t bw = hi[i].binding >> 6;
+            uint64_t bb = 1ull << (hi[i].binding & 63);
+            if (num == GFX_TEX_UINT) umask[bw] |= bb;
+            else if (num == GFX_TEX_SINT) smask[bw] |= bb;
         }
         vk_texture_unlock();
     }
-    if (!(umask | smask)) return base;
+    uint64_t any = 0;
+    for (int w = 0; w < GFX_IMG_MASK_WORDS; w++) any |= umask[w] | smask[w];
+    if (!any) return base;
+    if (!gfx_shader_is_prepared(base)) return gfx_shader_with_int_images(base, umask, smask);
     const uint8_t *ctl, *code;
     uint32_t len;
     if (!find_stage(ex->prog, st, &ctl, &code, &len)) return base;
@@ -1147,7 +1288,7 @@ static const GfxShader *shader_with_int_img(VkExec *ex, int st, const GfxShader 
     if (gs < 0) return base;
     GfxShaderAnswers a;
     answers_for(ex, st, ctl, 0, &a);
-    a.img_uint = umask, a.img_sint = smask;
+    memcpy(a.img_uint, umask, sizeof a.img_uint), memcpy(a.img_sint, smask, sizeof a.img_sint);
     const GfxShader *v = gfx_shader_get(gs, ctl, code, len, NULL, &a);
     return v ? v : base;
 }
@@ -1166,11 +1307,15 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
     memcpy(&magic, ctl, 4), memcpy(&ver, ctl + 4, 4);
     int raw_nvn2 = magic == 0x98761234u && ver == 0xC9u;
     if (st == NVN_STAGE_GS && !raw_nvn2 && native_gs_on() && nvn2_origin(code)) {
-        if (!native_gs_vs || !native_gs_fs) {   // its varyings follow from the other stages, which are still pending
-            if (pending) *pending = 1;
-            return NULL;
+        uint32_t sph0 = 0;
+        if (len >= 0x34) memcpy(&sph0, code + 0x30, sizeof sph0);
+        if (sph0 & (1u << 24)) {
+            if (!native_gs_vs || !native_gs_fs) {   // its varyings follow from the other stages, which are still pending
+                if (pending) *pending = 1;
+                return NULL;
+            }
+            if (!(ctl = native_gs_control(ctl, code, len))) return NULL;
         }
-        if (!(ctl = native_gs_control(ctl, code, len))) return NULL;
     }
     GfxShaderAnswers a;
     uint64_t serial = ex->prog->serial;
@@ -1187,7 +1332,7 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
                 memmove(&set[1], &set[0], w * sizeof *set);
                 set[0] = hit;
             }
-            return gfx_shader_is_prepared(set[0].s) ? shader_with_int_img(ex, st, set[0].s) : set[0].s;
+            return shader_with_int_img(ex, st, set[0].s);
         }
     }
     int gs = st == NVN_STAGE_VS ? GFX_STAGE_VS : st == NVN_STAGE_TCS ? GFX_STAGE_TCS :
@@ -1205,7 +1350,7 @@ static const GfxShader *shader_for(VkExec *ex, int st, int *present, int *pendin
         memmove(&set[1], &set[0], (SHADER_WAYS - 1) * sizeof *set);
         set[0] = (ShaderEnt){.serial = serial, .stage = st, .used = 1, .a = a, .s = s};
     }
-    if (s && gfx_shader_is_prepared(s)) s = shader_with_int_img(ex, st, s);
+    if (s) s = shader_with_int_img(ex, st, s);
     return s;
 }
 
@@ -1247,6 +1392,7 @@ static int bind_range(VkExec *ex, uint64_t addr, uint64_t size, uint64_t align, 
     if (!n) return 0;
     if (sp.offset % align == 0) {
         VK_MEM_USE(sp);
+        if (written && !writeback) vk_mem_guarded_write(ex->in_pass ? VK_NULL_HANDLE : ex->cb, &sp);
         *out = (VkDescriptorBufferInfo){sp.buffer, sp.offset, n};
         if (writeback) vk_mem_gpu_wrote(&sp, n);
         if (written) vk_usnap_drop(addr, n);
@@ -1350,13 +1496,77 @@ static VkDescriptorBufferInfo c0_info(VkExec *ex, int st) {
 }
 
 // The buffer range limits, read once: the device's properties are a cold cache line on every binding of every draw.
-static struct { uint64_t ubo_max, ubo_align, sbo_max, sbo_align; } LIM;
+static struct { uint64_t ubo_max, ubo_align, sbo_max, sbo_align, texel_align, texel_max_elems; } LIM;
 
 static void limits_init(void) {
     const VkPhysicalDeviceLimits *l = &vk_ctx()->props.limits;
     LIM.ubo_align = l->minUniformBufferOffsetAlignment, LIM.sbo_max = l->maxStorageBufferRange;
     LIM.sbo_align = l->minStorageBufferOffsetAlignment;
+    LIM.texel_align = l->minTexelBufferOffsetAlignment ? l->minTexelBufferOffsetAlignment : 1;
+    LIM.texel_max_elems = l->maxTexelBufferElements;
     __atomic_store_n(&LIM.ubo_max, l->maxUniformBufferRange, __ATOMIC_RELEASE);
+}
+
+static VkBufferView texel_buf_info(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage) {
+    if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
+    if (!h) return zbuf_view_for(r, storage);
+    uint64_t addr = 0, size = 0;
+    VkFormat fmt = VK_FORMAT_UNDEFINED;
+    uint32_t bpb = 0;
+    vk_texture_lock();
+    int ok = vk_texture_buffer_desc_locked(&ex->tex_pool, (int)(h & 0xfffff), &addr, &size, &fmt, &bpb, storage);
+    vk_texture_unlock();
+    if (!ok || !addr || !size || !bpb) return zbuf_view_for(r, storage);
+    if (storage && r && r->format && bpb == 4 &&
+        (fmt == VK_FORMAT_R32_SINT || fmt == VK_FORMAT_R32_UINT || fmt == VK_FORMAT_R32_SFLOAT)) {
+        if (r->format == 11) fmt = VK_FORMAT_R32_UINT;
+        else if (r->format == 12) fmt = VK_FORMAT_R32_SINT;
+        else if (r->format == 10) fmt = VK_FORMAT_R32_SFLOAT;
+    }
+    VkMemSpan sp;
+    if (!vk_mem_resolve(addr, 1, &sp)) return zbuf_view_for(r, storage);
+    uint64_t n = size < sp.avail ? size : sp.avail;
+    uint64_t max_bytes = (LIM.texel_max_elems && LIM.texel_max_elems <= UINT64_MAX / bpb)
+                             ? LIM.texel_max_elems * bpb : UINT64_MAX;
+    if (n > max_bytes) n = max_bytes;
+    n -= n % bpb;
+    if (!n) return zbuf_view_for(r, storage);
+    uint64_t align = LIM.texel_align ? LIM.texel_align : 1;
+    uint64_t need_align = align;
+    while (need_align % bpb) need_align += align;
+    if (sp.offset % need_align == 0) {
+        VK_MEM_USE(sp);
+        VkBufferView v = get_bview(sp.buffer, fmt, sp.offset, n);
+        if (!v) return zbuf_view_for(r, storage);
+        if (storage) {
+            vk_mem_gpu_wrote(&sp, n);
+            vk_usnap_drop(addr, n);
+            note_written(ex, addr, n);
+        }
+        count_use(sp.cls, storage ? VK_MUSE_SSBO : VK_MUSE_UBO, n);
+        VK_MEM_BOUND(sp);
+        return v;
+    }
+    if (!storage && !sp.alloc) {
+        VkBuffer sb;
+        VkDeviceSize so;
+        RS.volatile_ = 1;
+        memcpy(scratch_aligned(ex, n, need_align, &sb, &so), (const void *)(uintptr_t)addr, n);
+        VkBufferViewCreateInfo bv = {.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = sb,
+                                     .format = fmt, .offset = so, .range = n};
+        VkBufferView tv = VK_NULL_HANDLE;
+        if (vkCreateBufferView(vk_ctx()->device, &bv, NULL, &tv) == VK_SUCCESS) {
+            CbRes *cr = cb_res(ex);
+            if (cr->nbviews == cr->cbviews) cr->bviews = grow(cr->bviews, &cr->cbviews, sizeof *cr->bviews);
+            cr->bviews[cr->nbviews++] = tv;
+            vk_mem_count(sp.cls, VK_MUSE_CPU_READ, n);
+            vk_mem_count(VK_MCLS_SCRATCH, VK_MUSE_UBO, n);
+            return tv;
+        }
+    }
+    warn_once(W_SSBO_ALIGN, "texel buffer %#llx (offset %#llx, align %llu) is not backed or not aligned: a zero view is bound",
+              (unsigned long long)addr, (unsigned long long)sp.offset, (unsigned long long)need_align);
+    return zbuf_view_for(r, storage);
 }
 
 static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
@@ -1484,16 +1694,33 @@ static struct {
     uint64_t fence;                      // the submission the entries belong to
     uint32_t n;                          // updates noted in it
     struct { uint64_t lo, hi; const uint8_t *data; } u[UPD_N];
+    // The 4 KiB pages the submission's updates touched, hashed into a bit set, so a read of a block no update touched
+    // (most reads: ubo_ptr and ubo_handle run for every draw) skips the scan of up to UPD_N entries. In a level of an
+    // Unreal title that scan was most of the replay thread's 25 ms a frame. wide: an update over UPD_PAGES pages.
+    uint64_t pages[256];
+    uint8_t wide;
 } UPD;
+enum { UPD_PAGES = 64 };
+static uint32_t upd_page_bit(uint64_t page) { return (uint32_t)((page * 0x9E3779B97F4A7C15ull) >> 50); }   // 14 bits
 
 static void upd_note(const VkExec *ex, const p_update_ub *u) {
-    if (UPD.fence != ex->fence) UPD.fence = ex->fence, UPD.n = 0;
+    if (UPD.fence != ex->fence) UPD.fence = ex->fence, UPD.n = 0, UPD.wide = 0, memset(UPD.pages, 0, sizeof UPD.pages);
     UPD.u[UPD.n++ % UPD_N] = (typeof(UPD.u[0])){u->dst, u->dst + u->size, u->data};
+    uint64_t p0 = u->dst >> 12, p1 = (u->dst + (u->size ? u->size : 1) - 1) >> 12;
+    if (p1 - p0 >= UPD_PAGES) UPD.wide = 1;
+    else
+        for (uint64_t p = p0; p <= p1; p++) UPD.pages[upd_page_bit(p) >> 6] |= 1ull << (upd_page_bit(p) & 63);
 }
 
 // 1 when an update of this submission supplied [a, a+n).
 static int upd_read(const VkExec *ex, uint64_t a, void *out, size_t n) {
     if (UPD.fence != ex->fence) return 0;
+    if (!UPD.wide) {
+        int hit = 0;
+        for (uint64_t p = a >> 12, p1 = (a + (n ? n : 1) - 1) >> 12; p <= p1 && !hit; p++)
+            hit = (UPD.pages[upd_page_bit(p) >> 6] >> (upd_page_bit(p) & 63)) & 1;
+        if (!hit) return 0;
+    }
     for (uint32_t i = UPD.n, end = UPD.n > UPD_N ? UPD.n - UPD_N : 0; i-- > end;) {
         const typeof(UPD.u[0]) *e = &UPD.u[i % UPD_N];
         if (a >= e->hi || a + n <= e->lo) continue;
@@ -1516,6 +1743,41 @@ static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r) {
     if (vk_mem_resolve(u->addr + off, 8, &sp)) memcpy(&a, (const void *)(uintptr_t)(u->addr + off), 8);
     return a;
 }
+
+// A texture or image whose handle the shader reads from user uniform blocks (c3..c20) rather than the slot tables:
+// Unreal keeps its texture and sampler handles in its uniform buffers. The translator gives where (GfxShaderRes
+// raw_cbuf, raw_handle, as Ryujinx's TextureHandle packs them): the texture word at word0 of slot0 and, by the type,
+// the sampler word at word1 of slot1 (1: a separate sampler handle, OR-ed in, which is what
+// nvnDeviceGetSeparateSamplerHandle returns; 2: a sampler id, shifted to bits 20..31). Type 0 is a combined handle.
+int vk_exec_ubo_handle_res(const GfxShaderRes *r) {
+    int s0 = r->raw_cbuf & 0xffff;
+    return r->slot < 0 && r->raw_cbuf >= 0 && s0 >= 3 && s0 - 3 < 18;
+}
+
+static uint32_t ubo_word(const VkExec *ex, int st, int cslot, uint64_t off) {
+    if (cslot < 3 || cslot - 3 >= 18) return 0;
+    const p_bind_buf *u = &ex->ubo[st][cslot - 3];
+    uint32_t v = 0;
+    VkMemSpan sp;
+    if (!u->addr || u->size < off + 4 || upd_read(ex, u->addr + off, &v, 4)) return v;
+    const uint8_t *sb = vk_usnap_bytes(u->addr + off, 4);
+    if (sb) { memcpy(&v, sb, 4); return v; }
+    if (vk_mem_resolve(u->addr + off, 4, &sp)) memcpy(&v, (const void *)(uintptr_t)(u->addr + off), 4);
+    return v;
+}
+
+uint64_t vk_exec_ubo_handle(const VkExec *ex, int st, const GfxShaderRes *r) {
+    int s0 = r->raw_cbuf & 0xffff, s1 = (int)((uint32_t)r->raw_cbuf >> 16) - 1;
+    uint32_t w0 = r->raw_handle & 0x3fff, w1 = (r->raw_handle >> 14) & 0x3fff, type = r->raw_handle >> 28;
+    if (s1 < 0) s1 = s0;
+    uint64_t h = ubo_word(ex, st, s0, (uint64_t)w0 * 4);
+    if (type == 1) h |= ubo_word(ex, st, s1, (uint64_t)w1 * 4);
+    else if (type == 2) h |= (uint64_t)(ubo_word(ex, st, s1, (uint64_t)w1 * 4) & 0xfff) << 20;
+    return h;
+}
+
+// For vk_dump.c: the address a storage buffer read through a user uniform block resolves to (0: not such a buffer).
+uint64_t vk_exec_ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r) { return ubo_ptr_res(r) ? ubo_ptr(ex, st, r) : 0; }
 
 // Guarded NVN 2 candidates use the same bytes that the dispatch binds as uniform banks. Bank 0 includes pushed
 // roots and packed descriptor tables; bank 1 is the program's bounded compiler-constant data. No scalar is guessed
@@ -1587,6 +1849,11 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
     else if (slot >= 0 && slot < 16) b = ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
     else if (ubo_ptr_res(r)) up.addr = ubo_ptr(ex, st, r), b = &up;   // size 0: up to the end of the backing
     if (b) {
+        if (ubo && !written && !guarded && b->size &&
+            vk_usnap_find(b->addr, b->size < max ? b->size : max, align, &bi)) {
+            count_use(VK_MCLS_SCRATCH, VK_MUSE_UBO, bi.range);
+            return bi;
+        }
         // vk_caps.c: shaders translated for sbuf_align address the buffer from its address rounded down to it.
         // Read-only declared SSBOs from NVN 2 compute/vertex stages (which may index from 0 without adding the
         // sub-alignment lead) can be copied into an aligned scratch slice so offset 0 matches b->addr exactly.
@@ -1692,9 +1959,13 @@ static SubRange sampled_sub(const VkExec *ex, uint64_t h) {   // texture lock he
 // pass stay the same.
 static uint32_t feedback_scan(VkExec *ex, const GfxShader *fs) {
     descriptor_state(ex);
-    if (ex->fb_fs == fs && ex->fb_serial == ex->tex_serial && ex->fb_pass == ex->pass_serial) return ex->fb_sampled;
     const GfxShaderRes *res;
     int n = gfx_shader_resources(fs, GFX_RES_TEX, &res);
+    int has_ubo_tex = 0;
+    for (int r = 0; r < n && !has_ubo_tex; r++)
+        if (vk_exec_ubo_handle_res(&res[r])) has_ubo_tex = 1;
+    if (!has_ubo_tex && ex->fb_fs == fs && ex->fb_serial == ex->tex_serial && ex->fb_pass == ex->pass_serial)
+        return ex->fb_sampled;
     int st = nvn_stage_of(gfx_shader_stage(fs));
     if (st < 0) return 0;
     uint32_t m = 0, gen = vk_texture_slots_gen();   // before any lookup
@@ -1702,7 +1973,8 @@ static uint32_t feedback_scan(VkExec *ex, const GfxShader *fs) {
     for (int r = 0; r < n; r++)
         for (int k = 0; k < (res[r].count ? res[r].count : 1); k++) {
             int slot = res[r].slot + k;
-            uint64_t h = slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
+            uint64_t h = (!k && vk_exec_ubo_handle_res(&res[r])) ? vk_exec_ubo_handle(ex, st, &res[r])
+                         : (slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0);
             if (!h) continue;
             typeof(FM[0]) *f = &FM[(h * 0x9E3779B97F4A7C15ull) >> 51];
             if (memo && f->context == descriptor_serial && f->h == h && slot_still(ex, &f->gen, f->tok, h, gen)) {
@@ -1860,7 +2132,7 @@ static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int sto
         const VkTexImage *img = vk_texture_by_id_locked(&ex->tex_pool, (int)(h & 0xfffff), &v, &hv);
         if (img) view = get_view(ex, img, &v, hv, r->type, storage), *image = img->image;
         int sh_mode = -1, sh_func = -1;
-        if (img && storage) vk_texture_storage_bound_locked(img);
+        if (img && storage) vk_texture_storage_bound_locked(img, (r->flags & 4) != 0);
         if (img && !storage && ex->nfbl && in_fbl(ex, img->image)) layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
         if (!storage && !separate) {
             // A depth texture sampled without a compare reads one texel on the Switch, whatever the sampler's filter:
@@ -2253,11 +2525,19 @@ static const RsList *rs_list(const VkExec *ex, const VkPipeInfo *info) {
                 } else if (ubo_ptr_res(r)) {
                     if (np == RS_PTRS) { ok = 0; break; }
                     rs_add(tmp, &n, ex, &ex->ubo[st][r->cbuf_slot - 3], sizeof(p_bind_buf));
-                    ptr[np++] = (RsPtr){st, r};
+                    ptr[np++] = (RsPtr){st, r, 0};
                 }
-            } else if ((b->kind == GFX_RES_TEX || b->kind == GFX_RES_IMG) && b->type != VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER &&
-                       b->type != VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
+            } else if (b->kind == GFX_RES_TEX || b->kind == GFX_RES_IMG) {
                 int img = b->kind == GFX_RES_IMG, cap = img ? 32 : 128;
+                if (vk_exec_ubo_handle_res(r)) {   // the handle is read from a uniform block each draw: it goes in the signature
+                    if (np == RS_PTRS) { ok = 0; break; }
+                    int s0 = r->raw_cbuf & 0xffff;
+                    int s1 = (int)((uint32_t)r->raw_cbuf >> 16) - 1;
+                    rs_add(tmp, &n, ex, &ex->ubo[st][s0 - 3], sizeof(p_bind_buf));
+                    if (s1 >= 3 && s1 - 3 < 18 && s1 != s0)
+                        rs_add(tmp, &n, ex, &ex->ubo[st][s1 - 3], sizeof(p_bind_buf));
+                    ptr[np++] = (RsPtr){st, r, 1};
+                }
                 for (uint32_t k = 0; k < cnt; k++) {
                     int slot = r->slot + (int)k;
                     if (slot >= 0 && slot < cap) rs_add(tmp, &n, ex, img ? &ex->img[st][slot] : &ex->tex[st][slot], 8);
@@ -2309,7 +2589,8 @@ static int bind_sig(const VkExec *ex, const VkPipeInfo *info) {
         PUT(ps);
     }
     if (l->c0) PUT(c0_binst);
-    for (int i = 0; i < l->np; i++) PUT(ubo_ptr(ex, l->p[i].st, l->p[i].res));
+    for (int i = 0; i < l->np; i++)
+        PUT(l->p[i].tex ? vk_exec_ubo_handle(ex, l->p[i].st, l->p[i].res) : ubo_ptr(ex, l->p[i].st, l->p[i].res));
 #undef PUT
     diff |= n != RS.hn;
     RS.hn = n;
@@ -2413,10 +2694,17 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
             int img = b->kind == GFX_RES_IMG;
             if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
                 kind = 2;
-                for (uint32_t k = 0; k < cnt; k++) {   // buffer textures are not replayed yet
+                int storage = b->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+                for (uint32_t k = 0; k < cnt; k++) {
+                    int slot = r->slot + (int)k;
+                    uint64_t h = 0;
+                    if (!k && vk_exec_ubo_handle_res(r)) h = vk_exec_ubo_handle(ex, st, r);
+                    else if (img) h = slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
+                    else h = slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
+                    VkBufferView tv = texel_buf_info(ex, r, h, storage);
                     o[k].w[0] = 0, o[k].w[1] = 0, o[k].w[2] = 0;
-                    o[k].view = Z.zview;
-                    if (need_w) bv[nd + k] = Z.zview;
+                    o[k].view = tv;
+                    if (need_w) bv[nd + k] = tv;
                 }
             } else {
                 kind = 1;
@@ -2424,7 +2712,8 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
                 for (uint32_t k = 0; k < cnt; k++) {
                     int slot = r->slot + (int)k;
                     uint64_t h = 0;
-                    if (img) h = slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
+                    if (!k && vk_exec_ubo_handle_res(r)) h = vk_exec_ubo_handle(ex, st, r);
+                    else if (img) h = slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
                     else h = slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
                     tex_info(ex, r, h, img, r->separate, &o[k].image);
                     o[k].w[2] = (uint32_t)o[k].image.imageLayout;   // zero the tail padding
@@ -2972,12 +3261,23 @@ static int geometry_draw(VkExec *ex, uint32_t prim) {
         uint32_t len, flen, sph[5];
         if (!find_stage(ex->prog, NVN_STAGE_GS, &ctl, &code, &len)) return 0;
         if (nvn2_origin(code)) {
-            if (len < 0x30 + 0x60 || !find_stage(ex->prog, NVN_STAGE_FS, &fctl, &fcode, &flen) ||
-                vk_geometry_input(prim) != GFX_GEOMETRY_TRIANGLES) return 0;
+            uint8_t gi = vk_geometry_input(prim);
+            if (len < 0x30 + 0x60 || !gi) return 0;
             memcpy(sph, code + 0x30, sizeof sph);
-            if (!(sph[0] & (1u << 24)) || sph[2] >> 24 != 1 || (sph[3] >> 24 & 15) != 7 || (sph[4] & 0xfff) != 1) {
-                warn_once(W_GEOMETRY, "native GS: a stage outside the passthrough subset keeps the vertex and fragment path");
-                return 0;
+            uint32_t out_topo = sph[3] >> 24 & 15;
+            if (sph[0] & (1u << 24)) {
+                if (!find_stage(ex->prog, NVN_STAGE_FS, &fctl, &fcode, &flen) ||
+                    gi != GFX_GEOMETRY_TRIANGLES) return 0;
+                if (sph[2] >> 24 != 1 || out_topo != 7 || (sph[4] & 0xfff) != 1) {
+                    warn_once(W_GEOMETRY, "native GS: a stage outside the supported native GS subset keeps the vertex and fragment path");
+                    return 0;
+                }
+            } else {
+                if ((sph[0] >> 10 & 15) != 4 || (sph[2] >> 24) == 0 ||
+                    (out_topo != 6 && out_topo != 7) || (sph[4] & 0xfff) == 0) {
+                    warn_once(W_GEOMETRY, "native GS: a stage outside the supported native GS subset keeps the vertex and fragment path");
+                    return 0;
+                }
             }
             // Metal has no geometry stage (MoltenVK): skip before the pipeline and the lowered GS are built. The vertex
             // and fragment stages alone would draw black, so the draw is dropped and counted in draws skipped.
@@ -2986,7 +3286,7 @@ static int geometry_draw(VkExec *ex, uint32_t prim) {
                 __atomic_fetch_add(&gfx_counters.draws_skipped, 1, __ATOMIC_RELAXED);
                 return -1;
             }
-            geometry_input = GFX_GEOMETRY_TRIANGLES;
+            geometry_input = gi;
             return 1;
         }
         // An ordinary GS still follows its own opt-in and validation below.
@@ -3736,12 +4036,117 @@ static void bind_handles(uint64_t *dst, int cap, const p_bind_handles *b) {
     memcpy(&dst[b->first], b->h, sizeof(uint64_t) * (size_t)b->n);
 }
 
+// BindProgram(program, stages) binds program for the stages in its mask only, and leaves the others as they were.
+// Unreal binds a vertex program (mask 1) and a fragment program (mask 2) of their own, unbinds the geometry stage
+// (NULL, 4) and the stage at 0x80, and binds compute programs (0x20) between draws. ex->prog is what a draw reads its
+// stages from: the program when every bound graphics stage comes from the same one (one program for all stages, as
+// the other titles bind), else a program made of the bound stages, kept per combination so its serial (the key of
+// every shader and pipeline cache) stays the same each time that combination is bound.
+// Combined programs live as long as the process (a bound one may be read while later ones are made) and are found
+// through an open-addressed table keyed by the five stage serials: Unreal binds two programs a draw, thousands a frame.
+typedef struct { uint64_t key[5]; prog_t p; } Combo;
+static Combo **combo_tab;
+static size_t combo_n, combo_cap;   // combo_cap: table slots, a power of two
+static PlatMutex combo_lock = PLAT_MUTEX_INIT;
+
+static uint64_t combo_hash(const uint64_t key[5]) {
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    for (int i = 0; i < 5; i++) h = (h ^ key[i]) * 0x100000001b3ull, h ^= h >> 29;
+    return h;
+}
+
+static void combo_insert(Combo *c) {
+    size_t m = combo_cap - 1, at = combo_hash(c->key) & m;
+    while (combo_tab[at]) at = (at + 1) & m;
+    combo_tab[at] = c;
+}
+
+static const prog_t *combined_program(const prog_t *const st[5]) {
+    uint64_t key[5];
+    for (int i = 0; i < 5; i++) key[i] = st[i] ? st[i]->serial : 0;
+    plat_mutex_lock(&combo_lock);
+    const prog_t *r = NULL;
+    if (combo_cap)
+        for (size_t m = combo_cap - 1, at = combo_hash(key) & m; combo_tab[at] && !r; at = (at + 1) & m)
+            if (!memcmp(combo_tab[at]->key, key, sizeof key)) r = &combo_tab[at]->p;
+    if (!r) {
+        if ((combo_n + 1) * 2 > combo_cap) {   // grow at half full
+            Combo **old = combo_tab;
+            size_t oc = combo_cap;
+            combo_cap = oc ? oc * 2 : 1024;
+            if (!(combo_tab = calloc(combo_cap, sizeof *combo_tab))) rt_fatal("vk_exec: out of memory for combined programs");
+            for (size_t i = 0; i < oc; i++)
+                if (old[i]) combo_insert(old[i]);
+            free(old);
+        }
+        Combo *c = calloc(1, sizeof *c);
+        if (!c) rt_fatal("vk_exec: out of memory for combined programs");
+        memcpy(c->key, key, sizeof key);
+        c->p.magic = st[0] ? st[0]->magic : 0;
+        for (int i = 0; i < 5; i++) {
+            const uint8_t *ctl, *code;
+            uint32_t len;
+            if (!st[i] || !find_stage(st[i], i, &ctl, &code, &len)) continue;
+            for (uint32_t k = 0; k < st[i]->nstage && k < 6; k++)
+                if ((const uint8_t *)st[i]->sd[k].control == ctl && c->p.nstage < 6) c->p.sd[c->p.nstage++] = st[i]->sd[k];
+        }
+        c->p.serial = nvn_new_serial();
+        combo_insert(c);
+        combo_n++;
+        r = &c->p;
+    }
+    plat_mutex_unlock(&combo_lock);
+    return r;
+}
+
+// The graphics program a draw reads (ex->prog), from the stage bindings; called before a draw when a graphics stage was
+// bound since the last one. Resolving at the draw, not at each bind, skips the half-bound states between Unreal's
+// vertex and fragment binds, which would each make a combination no draw uses.
+static void resolve_program(VkExec *ex) {
+    ex->prog_dirty = 0;
+    const prog_t *one = NULL;
+    int same = 1;
+    int32_t stages = 0;
+    for (int i = 0; i < 5; i++) {
+        const prog_t *q = ex->stage_prog[i];
+        if (!q) continue;
+        stages |= 1 << i;
+        if (!one) one = q;
+        else if (q != one) same = 0;
+    }
+    const prog_t *p = !one ? NULL : same ? one : combined_program(ex->stage_prog);
+    if (p != ex->prog || stages != ex->prog_stages) ex->prog = p, ex->prog_stages = stages, bind_gen++;
+}
+
+static void bind_program(VkExec *ex, const prog_t *p, int32_t mask) {
+    uint32_t m = (uint32_t)mask;
+    if (!m) m = 0x3f;   // no stage named: bind it for every stage, as before
+    // Bits past compute (Unreal unbinds the stage at 0x80 after every program bind) name stages the replay does not
+    // have: they leave these six alone.
+    for (int i = 0; i < 6; i++)
+        if (m & (1u << i)) ex->stage_prog[i] = p, ex->stage_mask[i] = mask;
+    if (m & NVN_SHADER_STAGE_COMPUTE_BIT) ex->cprog = p, ex->cprog_stages = mask;
+    if (m & NVN_SHADER_STAGE_ALL_GRAPHICS_BITS) ex->prog_dirty = 1;
+}
+
+// A dispatch runs with the compute binding in ex->prog, where every program lookup reads it, and the graphics binding
+// back afterwards; bind_gen moves both ways, so nothing cached for one program is taken for the other.
+static void swap_programs(VkExec *ex) {
+    const prog_t *p = ex->prog;
+    int32_t st = ex->prog_stages;
+    ex->prog = ex->cprog, ex->prog_stages = ex->cprog_stages;
+    ex->cprog = p, ex->cprog_stages = st;
+    bind_gen++;
+}
+
 void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
+    if (ex->prog_dirty && (op == OP_DRAW || op == OP_DRAW_IDX || op == OP_DRAW_IDX_IND || op == OP_DRAW_IDX_IND_COUNT))
+        resolve_program(ex);
     geometry_context_log(ex, op, payload);
     switch (op) {
     case OP_BIND_PROGRAM: {
         const p_bind_program *b = payload;
-        ex->prog = b->prog, ex->prog_stages = b->stages;
+        bind_program(ex, b->prog, b->stages);
         bind_gen++;
         break;
     }
@@ -3840,10 +4245,10 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     case OP_UPDATE_UB: op_update_ub(ex, payload); break;
     case OP_DRAW: op_draw(ex, payload); break;
     case OP_DRAW_IDX: op_draw_idx(ex, payload); break;
-    case OP_DISPATCH: op_dispatch(ex, payload); break;
+    case OP_DISPATCH: swap_programs(ex), op_dispatch(ex, payload), swap_programs(ex); break;
     case OP_DRAW_IDX_IND: op_draw_idx_ind(ex, payload); break;
     case OP_DRAW_IDX_IND_COUNT: op_draw_idx_ind_count(ex, payload); break;
-    case OP_DISPATCH_IND: op_dispatch_ind(ex, payload); break;
+    case OP_DISPATCH_IND: swap_programs(ex), op_dispatch_ind(ex, payload), swap_programs(ex); break;
     default: rt_fatal("vk: op %s is not a draw op", nvn_op_name(op));
     }
 }

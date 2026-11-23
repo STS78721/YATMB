@@ -36,6 +36,7 @@ enum { GFX_GEOMETRY_NONE, GFX_GEOMETRY_POINTS, GFX_GEOMETRY_LINES, GFX_GEOMETRY_
 enum { GFX_GEOMETRY_OUTPUT_POINTS = 1, GFX_GEOMETRY_OUTPUT_LINE_STRIP, GFX_GEOMETRY_OUTPUT_TRIANGLE_STRIP };
 #define GFX_GEOMETRY_VERSION 1
 #define GFX_GEOMETRY_PASSTHROUGH_VERSION 2
+#define GFX_IMG_MASK_WORDS 4
 typedef struct {                                           // the translator's answers (Program.cs Accessor)
     uint8_t tex_type[32], img_type[32], img_format[32];    // per c2 slot; 0 = not asked; types are GFX_TEX_*,
                                                            // img_format is Ryujinx TextureFormat
@@ -43,7 +44,7 @@ typedef struct {                                           // the translator's a
     uint16_t local[3]; uint32_t shared_bytes;
     uint8_t depth_minus_w;
     uint8_t geometry_input;                              // GFX_GEOMETRY_*; required for GS, zero for other stages
-    uint64_t img_uint, img_sint;                         // CS texture/image binding masks requiring uint/sint SPIR-V
+    uint64_t img_uint[GFX_IMG_MASK_WORDS], img_sint[GFX_IMG_MASK_WORDS]; // CS/GS/etc. texture/image binding masks requiring uint/sint SPIR-V
 } GfxShaderAnswers;
 typedef struct GfxShader GfxShader;                        // SPIR-V words + parsed reflection; owned by the cache
 void gfx_shader_nvn2_dump(const uint8_t *control, const uint8_t *code);   // DKB_SHADER_DUMP (gfx_shader.c)
@@ -62,6 +63,9 @@ int gfx_shader_is_prepared(const GfxShader *s);
 int gfx_shader_is_source_passthrough(const GfxShader *s);
 const GfxShader *gfx_shader_get(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
                                 const uint8_t *c1, const GfxShaderAnswers *a);   // blocks; NULL on failure (counted)
+const GfxShader *gfx_shader_with_int_images(const GfxShader *base,
+                                            const uint64_t umask[GFX_IMG_MASK_WORDS],
+                                            const uint64_t smask[GFX_IMG_MASK_WORDS]);
 // As gfx_shader_get with c1 inside the code, but a shader in neither cache is queued to a background translation and
 // NULL returned with *pending = 1 until it is ready. A failed translation stays failed (*pending = 0).
 const GfxShader *gfx_shader_get_async(int stage, const uint8_t *control, const uint8_t *code, uint64_t code_size,
@@ -117,6 +121,8 @@ typedef struct {
     uint16_t handle;            // TEX/IMG: raw handle (word offset; separate: texture | sampler << 14); SSBO: address offset
     uint16_t count;             // descriptors (array length)
     uint8_t separate;           // TEX: texture and sampler handles are separate
+    int32_t raw_cbuf;           // TEX/IMG: the translator's cbuf_slot and handle unpacked (Ryujinx TextureHandle): slots
+    uint32_t raw_handle;        // slot0 | (slot1 + 1) << 16, offsets word0 | word1 << 14 | handle type << 28
 } GfxShaderRes;
 typedef struct { uint8_t type, comps, packed, scalar_bits; } GfxShaderIo;   // scalar_bits: actual numeric SPIR-V width, 0 unknown
 uint64_t gfx_shader_origin(const GfxShader *s);             // NVN 2 stage origin (nvn2_origin of its code) noted at get time, or 0

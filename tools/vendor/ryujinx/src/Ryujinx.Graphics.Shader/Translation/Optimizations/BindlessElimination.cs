@@ -455,7 +455,20 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
                 if (texOp.Inst.IsTextureQuery())
                 {
-                    texOp.Type = newType;
+                    int newDims = (newType & SamplerType.Mask) == SamplerType.TextureCube ? 2 : newType.Dimensions;
+                    if (newType.HasFlag(SamplerType.Array))
+                    {
+                        newDims++;
+                    }
+
+                    // Keep a 3D bindless TXQ (mask & 4) when the host has no metadata for the resolved
+                    // cbuf handle and falls back to a <3D type (e.g. 2D), and never downgrade below the
+                    // queried component index.
+                    if (texOp.Inst != Instruction.TextureQuerySize ||
+                        (texOp.Type == SamplerType.Texture3D ? newDims >= 3 : (texOp.Index == 3 || newDims > texOp.Index)))
+                    {
+                        texOp.Type = newType;
+                    }
                 }
                 else if (texOp.Type == SamplerType.TextureBuffer && newType == SamplerType.Texture1D)
                 {

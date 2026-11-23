@@ -24,9 +24,12 @@ void kern_fiber_switch(Cpu *c);
 void kern_fiber_current(Cpu *c);
 
 uint64_t kern_threads_created(void);
+void kern_configure_main(int prio, int core, uint64_t stack_size);
 
 // The guest frame-pointer chain from c->x[29] to stderr.
 void kern_backtrace(const Cpu *c);
+// Log live guest threads and their wait/backtrace state.
+void kern_dump_threads(void);
 
 // ---- probe support
 enum { KERN_WAIT_NONE, KERN_WAIT_LOCK, KERN_WAIT_CONDVAR, KERN_WAIT_ADDRESS, KERN_WAIT_SYNC };

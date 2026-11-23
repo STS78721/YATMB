@@ -1,0 +1,15 @@
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/Optimizer.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/Optimizer.cs
+@@ -391,7 +391,11 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+                         // result is unused, so its sources are still live: stripping their use lists here made the next
+                         // DCE pass delete the whole chain feeding a global-memory atomic turned into a helper call, which
+                         // then read an uninitialised value (TOTK's sun-visibility kernel; our c7830fac lost its atomicMin).
+-                        if (!HasSideEffects(src.AsgOp))
++                        // Likewise, a multi-dest operation (such as a multi-component texture fetch where one destination
++                        // channel is dead while others are still used) stays in the block until ALL of its destinations
++                        // have zero uses. Check IsUnused(src.AsgOp) so live multi-dest ops do not have their coordinate
++                        // or handle sources stripped from UseOps and dead-code-eliminated.
++                        if (IsUnused(src.AsgOp))
+                         {
+                             nodes.Enqueue(src.AsgOp);
+                         }

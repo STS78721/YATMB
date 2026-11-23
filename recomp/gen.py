@@ -116,14 +116,27 @@ def discover(mod):
     # whose register is the base of an ADD (shifted or extended register) in the next 4 instructions
     # (`adr xA, L; ldrb wO, [..]; add xA, xA, wO, lsl #2`), however far the scheduler moved the `br`.
     br = idx((w & 0xFFFFFC1F) == 0xD61F0000)
-    nxt = np.searchsorted(br, adr)
-    has_br = nxt < len(br)
-    near = np.zeros(len(adr), dtype=bool)
-    near[has_br] = br[nxt[has_br]] - adr[has_br] <= 16
+    term = idx(((w & 0xFFFFFC1F) == 0xD65F0000) | (w == 0xD65F0BFF) | (w == 0xD65F0FFF) | ((w & 0xFC000000) == 0x14000000))
+    nxt_br = np.searchsorted(br, adr)
+    has_br = nxt_br < len(br)
+    nxt_term = np.searchsorted(term, adr)
+    has_term = nxt_term < len(term)
     rd = w[adr] & 31
-    for k in range(1, 5):
-        x = w[np.minimum(adr + k, n - 1)]
-        near |= (((x & 0xFF200000) == 0x8B000000) | ((x & 0xFFE00000) == 0x8B200000)) & (((x >> 5) & 31) == rd)
+    near = np.zeros(len(adr), dtype=bool)
+    if len(br):
+        br_idx = br[np.minimum(nxt_br, len(br) - 1)]
+        same_blk = np.ones(len(adr), dtype=bool)
+        if len(term):
+            same_blk[has_term] = br_idx[has_term] < term[nxt_term[has_term]]
+        near |= has_br & (br_idx - adr <= 16) & same_blk & (((w[br_idx] >> 5) & 31) == rd)
+    stopped = np.zeros(len(adr), dtype=bool)
+    for k in range(1, 9):
+        pos = np.minimum(adr + k, n - 1)
+        x = w[pos]
+        is_add = ((x & 0xFF200000) == 0x8B000000) | ((x & 0xFFE00000) == 0x8B200000)
+        uses_rd = (((x >> 5) & 31) == rd) | (((x >> 16) & 31) == rd)
+        near |= ~stopped & is_add & uses_rd
+        stopped |= ((x & 0xFFFFFC1F) == 0xD65F0000) | (x == 0xD65F0BFF) | (x == 0xD65F0FFF) | ((x & 0xFC000000) == 0x14000000)
     adr = adr[~near]
     adr_bytes = pc0 + adr * 4 + imm21(adr)
     is_adrp = (w & 0x9F000000) == 0x90000000

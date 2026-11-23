@@ -24,7 +24,7 @@ typedef struct { const char *lang; const char *const *text; } Row;
     [UI_SWKBD_CANCEL] = cancel, [UI_SWKBD_PAD_HINT] = hint, LANG_NAMES
 
 static const char *const text_en[UI_TEXT_COUNT] = {
-    SWKBD("Text entry", "Enter a name", "Horse", "OK", "Cancel", "Controller: A = OK, B = Cancel"),
+    SWKBD("Text entry", "Enter a name", "Player", "OK", "Cancel", "Controller: A = OK, B = Cancel"),
 
     [UI_MENU_TITLE] = "Settings",
     [UI_MENU_TAB_SCREEN] = "Screen", [UI_MENU_TAB_GAME] = "Game", [UI_MENU_TAB_SOUND] = "Sound",
@@ -41,8 +41,10 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_GPU_DESC_RESTART] = "The graphics card that draws the game.",
     [UI_MENU_HINT_OK] = "OK", [UI_MENU_HINT_BACK] = "Back",
     [UI_MENU_THEME] = "Menu theme",
+    [UI_MENU_THEME_STORYBOOK] = "Storybook Meadow",
     [UI_MENU_THEME_TENNIS] = "SteelTemple ShadowRacket", [UI_MENU_THEME_LIGHT] = "Light", [UI_MENU_THEME_DARK] = "Dark",
-    [UI_MENU_THEME_DESC] = "The colours and court motif of this menu. SteelTemple ShadowRacket: stadium turf green, steel shadow, tennis balls & rackets. Light: grey and white with cyan. Dark: black with red accents.",
+    [UI_MENU_THEME_DESC] = "The colours and visual motif of this menu. Light: grey and white with cyan. Dark: black with red accents.",
+    [UI_MENU_THEME_DESC_STORYBOOK] = "The colours and visual motif of this menu. Storybook Meadow: lush meadow emerald, warm parchment text, golden stars and spotted egg emblem. Light: grey and white with cyan. Dark: black with red accents.",
     [UI_MENU_CONTINUE] = "Continue", [UI_MENU_QUIT] = "Quit game",
     [UI_MENU_ON] = "On", [UI_MENU_OFF] = "Off", [UI_MENU_AUTO] = "Automatic", [UI_MENU_DEFAULT_MARK] = "default",
     [UI_MENU_AFTER_RESTART] = "after restart", [UI_MENU_SET_BY_ENV] = "set by environment variable",
@@ -247,7 +249,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_BIND_DESC_R] = "Throw a weapon.", [UI_BIND_DESC_ZL] = "Shield, lock on.", [UI_BIND_DESC_ZR] = "Bow.",
     [UI_BIND_DESC_PLUS] = "Menu, inventory.", [UI_BIND_DESC_MINUS] = "Map.",
     [UI_BIND_DESC_DPAD] = "Quick-select.",
-    [UI_BIND_DESC_MOVE] = "Moves Link like the left stick. The controller's left stick always works too.",
+    [UI_BIND_DESC_MOVE] = "Moves the character like the left stick. The controller's left stick always works too.",
     [UI_BIND_DESC_CAMERA] = "Turns the camera like the right stick. The mouse and the controller's right stick always "
                             "work too.",
     [UI_KEY_SPACE] = "Space", [UI_KEY_TAB] = "Tab", [UI_KEY_LSHIFT] = "Left Shift", [UI_KEY_LCTRL] = "Left Ctrl",
@@ -370,7 +372,7 @@ static const char *const text_en[UI_TEXT_COUNT] = {
 };
 
 static const char *const text_ru[UI_TEXT_COUNT] = {
-    SWKBD("Ввод текста", "Введите имя", "Лошадь", "ОК", "Отмена", "Контроллер: A — ОК, B — отмена"),
+    SWKBD("Ввод текста", "Введите имя", "Игрок", "ОК", "Отмена", "Контроллер: A — ОК, B — отмена"),
 
     [UI_MENU_TITLE] = "Настройки",
     [UI_MENU_TAB_SCREEN] = "Экран", [UI_MENU_TAB_GAME] = "Игра", [UI_MENU_TAB_SOUND] = "Звук",
@@ -387,8 +389,10 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_GPU_DESC_RESTART] = "Видеокарта для отрисовки игры.",
     [UI_MENU_HINT_OK] = "OK", [UI_MENU_HINT_BACK] = "Назад",
     [UI_MENU_THEME] = "Тема меню",
+    [UI_MENU_THEME_STORYBOOK] = "Сказочный луг",
     [UI_MENU_THEME_TENNIS] = "SteelTemple ShadowRacket", [UI_MENU_THEME_LIGHT] = "Светлая", [UI_MENU_THEME_DARK] = "Тёмная",
-    [UI_MENU_THEME_DESC] = "Цвета и оформление меню. SteelTemple ShadowRacket: зелёный корт, стальная тень, мячи и ракетки. Светлая: серый и белый. Тёмная: чёрный с красным.",
+    [UI_MENU_THEME_DESC] = "Цвета и оформление меню. Светлая: серый и белый. Тёмная: чёрный с красным.",
+    [UI_MENU_THEME_DESC_STORYBOOK] = "Цвета и оформление меню. Сказочный луг: изумрудный лес, тёплый пергамент, золотые звёзды и пятнистое яйцо. Светлая: серый и белый. Тёмная: чёрный с красным.",
     [UI_MENU_CONTINUE] = "Продолжить", [UI_MENU_QUIT] = "Выйти из игры",
     [UI_MENU_ON] = "Вкл.", [UI_MENU_OFF] = "Выкл.", [UI_MENU_AUTO] = "Автоматически",
     [UI_MENU_DEFAULT_MARK] = "по умолчанию",
@@ -561,7 +565,7 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_BIND_DESC_R] = "Бросок оружия.", [UI_BIND_DESC_ZL] = "Щит, захват цели.", [UI_BIND_DESC_ZR] = "Лук.",
     [UI_BIND_DESC_PLUS] = "Меню, инвентарь.", [UI_BIND_DESC_MINUS] = "Карта.",
     [UI_BIND_DESC_DPAD] = "Быстрый выбор.",
-    [UI_BIND_DESC_MOVE] = "Двигает Линка, как левый стик. Левый стик контроллера тоже всегда работает.",
+    [UI_BIND_DESC_MOVE] = "Двигает персонажа, как левый стик. Левый стик контроллера тоже всегда работает.",
     [UI_BIND_DESC_CAMERA] = "Поворачивает камеру, как правый стик. Мышь и правый стик контроллера тоже всегда "
                             "работают.",
     [UI_KEY_SPACE] = "Пробел", [UI_KEY_TAB] = "Tab", [UI_KEY_LSHIFT] = "Левый Shift", [UI_KEY_LCTRL] = "Левый Ctrl",
@@ -688,17 +692,17 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
 };
 
 #define SWKBD_ONLY(name, ...) static const char *const name[UI_TEXT_COUNT] = {SWKBD(__VA_ARGS__)}
-SWKBD_ONLY(text_ja, "文字入力", "名前を入力してください", "ウマ", "OK", "キャンセル", "コントローラー: A = OK、B = キャンセル");
-SWKBD_ONLY(text_fr, "Saisie de texte", "Entrez un nom", "Cheval", "OK", "Annuler", "Manette : A = OK, B = Annuler");
-SWKBD_ONLY(text_de, "Texteingabe", "Gib einen Namen ein", "Pferd", "OK", "Abbrechen", "Controller: A = OK, B = Abbrechen");
-SWKBD_ONLY(text_it, "Inserimento testo", "Inserisci un nome", "Cavallo", "OK", "Annulla", "Controller: A = OK, B = Annulla");
-SWKBD_ONLY(text_es, "Introducir texto", "Introduce un nombre", "Caballo", "Aceptar", "Cancelar",
+SWKBD_ONLY(text_ja, "文字入力", "名前を入力してください", "プレイヤー", "OK", "キャンセル", "コントローラー: A = OK、B = キャンセル");
+SWKBD_ONLY(text_fr, "Saisie de texte", "Entrez un nom", "Joueur", "OK", "Annuler", "Manette : A = OK, B = Annuler");
+SWKBD_ONLY(text_de, "Texteingabe", "Gib einen Namen ein", "Spieler", "OK", "Abbrechen", "Controller: A = OK, B = Abbrechen");
+SWKBD_ONLY(text_it, "Inserimento testo", "Inserisci un nome", "Giocatore", "OK", "Annulla", "Controller: A = OK, B = Annulla");
+SWKBD_ONLY(text_es, "Introducir texto", "Introduce un nombre", "Jugador", "Aceptar", "Cancelar",
            "Mando: A = Aceptar, B = Cancelar");
-SWKBD_ONLY(text_nl, "Tekstinvoer", "Voer een naam in", "Paard", "OK", "Annuleren", "Controller: A = OK, B = Annuleren");
-SWKBD_ONLY(text_pt, "Inserir texto", "Introduz um nome", "Cavalo", "OK", "Cancelar", "Comando: A = OK, B = Cancelar");
-SWKBD_ONLY(text_zh_hans, "文字输入", "请输入名字", "马儿", "确定", "取消", "手柄：A 确定，B 取消");
-SWKBD_ONLY(text_zh_hant, "文字輸入", "請輸入名字", "馬兒", "確定", "取消", "手把：A 確定，B 取消");
-SWKBD_ONLY(text_ko, "문자 입력", "이름을 입력하세요", "말", "확인", "취소", "컨트롤러: A 확인, B 취소");
+SWKBD_ONLY(text_nl, "Tekstinvoer", "Voer een naam in", "Speler", "OK", "Annuleren", "Controller: A = OK, B = Annuleren");
+SWKBD_ONLY(text_pt, "Inserir texto", "Introduz um nome", "Jogador", "OK", "Cancelar", "Comando: A = OK, B = Cancelar");
+SWKBD_ONLY(text_zh_hans, "文字输入", "请输入名字", "玩家", "确定", "取消", "手柄：A 确定，B 取消");
+SWKBD_ONLY(text_zh_hant, "文字輸入", "請輸入名字", "玩家", "確定", "取消", "手把：A 確定，B 取消");
+SWKBD_ONLY(text_ko, "문자 입력", "이름을 입력하세요", "플레이어", "확인", "취소", "컨트롤러: A 확인, B 취소");
 
 static const Row rows[] = {
     {"en", text_en}, {"ja", text_ja}, {"fr", text_fr}, {"de", text_de}, {"it", text_it}, {"es", text_es},

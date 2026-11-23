@@ -1006,6 +1006,12 @@ NVN_API(nvnCommandBufferWaitSync) {
     REC(o, OP_WAIT_SYNC, p_wait_sync)->sync = arg_p(c, 1);
     hw_fix(o, 0);   // the SDK records a CPU control entry here; GPU wait commands are emitted at submit
 }
+// void nvnCommandBufferFenceSync(NVNcommandBuffer *cmd, NVNsync *sync, NVNsyncCondition condition, int flags)
+NVN_API(nvnCommandBufferFenceSync) {
+    cmd_t *o = cmd_of(c);
+    REC(o, OP_FENCE_SYNC, p_fence_sync)->sync = arg_p(c, 1);
+    hw_fix(o, 0);
+}
 // Commands without an effect on this replay (hle_nvn.c g_nops). WaitEvent still relies on in-order replay; shader
 // scratch memory and the tessellation patch size have no host counterpart the replay needs.
 // void nvnCommandBufferWaitEvent(cmd, const NVNevent *event,
@@ -1076,6 +1082,37 @@ static void wait_submission(const uint64_t *handles, int n) {
     // fence_done/fence_wait include completion callbacks, unlike the raw Vulkan timeline.
     if (b->fence_done() < target && !b->fence_wait(target, UINT64_MAX))
         rt_fatal("nvn: CommandBufferWaitSync could not reach producer fence %llu", (unsigned long long)target);
+}
+
+static void fence_syncs_walk(const uint8_t *p, uint64_t fence, int depth) {
+    for (;;) {
+        op_hdr h;
+        memcpy(&h, p, sizeof h);
+        if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_)
+            rt_fatal("nvn: corrupt recording at %p while fencing syncs (op %u size %u)", (const void *)p, h.op, h.size);
+        if (h.op == OP_END) return;
+        if (h.op == OP_JUMP) {
+            memcpy(&p, p + 8, 8);
+            continue;
+        }
+        if (h.op == OP_CALL) {
+            uint64_t called;
+            memcpy(&called, p + 8, 8);
+            if (depth >= 16) rt_fatal("nvn: FenceSync submission: call depth over 16");
+            fence_syncs_walk((const uint8_t *)(uintptr_t)called, fence, depth + 1);
+        } else if (h.op == OP_FENCE_SYNC) {
+            sync_t *s = ((const p_fence_sync *)(const void *)(p + 8))->sync;
+            if (s && s->magic == MAGIC('S', 'Y', 'N', 'C')) {
+                s->fence = fence;
+                __atomic_store_n(&s->fenced, 1u, __ATOMIC_RELEASE);
+            }
+        }
+        p += h.size;
+    }
+}
+
+void nvn_submit_fence_syncs(const uint64_t *handles, int n, uint64_t fence) {
+    for (int i = 0; i < n; i++) fence_syncs_walk((const uint8_t *)(uintptr_t)handles[i], fence, 0);
 }
 
 static int resolve_deferred(const uint8_t *p, int depth) {   // returns the number of deferred binds and pushes
@@ -1190,7 +1227,7 @@ const char *nvn_op_name(uint32_t op) {
         "DRAW_IDX", "DISPATCH", "BARRIER", "SET_TEX_POOL", "SET_SAMP_POOL", "COPY_B2T", "COPY_STRIDE", "BLEND_COLOR",
         "COPY_T2B", "BIND_IMG", "COPY_T2T", "RESET_COUNTER", "CLEAR_TEX", "DEPTH_CLAMP", "RENDER_ENABLE",
         "RASTER_DISCARD", "RENDER_COND", "PRIM_RESTART", "DRAW_IDX_IND", "DISPATCH_IND", "CLEAR_BUF", "PUSH_CONST", "WAIT_SYNC",
-        "DRAW_IDX_IND_COUNT", "SET_PATCH_SIZE",
+        "DRAW_IDX_IND_COUNT", "SET_PATCH_SIZE", "FENCE_SYNC",
     };
     _Static_assert(sizeof names / sizeof *names == OP_COUNT_, "one name per op");
     return op < OP_COUNT_ ? names[op] : "?";

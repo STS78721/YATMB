@@ -20,6 +20,7 @@
 
 static uint64_t g_svcs;
 void (*volatile svc_test_exit_hook)(unsigned code);
+__attribute__((weak)) void vk_diag_report(void) {}
 
 RtStats rt_stats(void) {
     return (RtStats){__atomic_load_n(&g_svcs, __ATOMIC_RELAXED), kern_threads_created(), hostfn_calls()};
@@ -206,6 +207,8 @@ static void svc_body(Cpu *c, uint32_t imm, uint64_t pc) {
             x[0] = R_OK;
             return;
         }
+        vk_diag_report();
+        kern_dump_threads();
         svc_fatal(c, imm, pc, "Break (the SDK aborted)");
     }
     case 0x27: {   // OutputDebugString(x0 text, x1 size)

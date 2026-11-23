@@ -307,7 +307,7 @@ static void window_main(void *arg) {
                                           GetSystemMetrics(SM_CYICON), LR_SHARED),
                       .hIconSm = LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
                                             GetSystemMetrics(SM_CYSMICON), LR_SHARED),
-                      .hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW), .lpszClassName = L"TotKRecompWindow"};
+                      .hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW), .lpszClassName = L"UniversalNS2Window"};
     RegisterClassExW(&wc);
     int cw, ch, ow, oh;
     cfg_window_size(&cw, &ch);
@@ -320,7 +320,7 @@ static void window_main(void *arg) {
     int background = g_background = cfg_get("TOTK_BACKGROUND_WINDOW") && atoi(cfg_get("TOTK_BACKGROUND_WINDOW"));
     wchar_t title_w[128];
     const char *dn = game_profile()->display_name;
-    swprintf(title_w, sizeof title_w / sizeof title_w[0], L"%hs (PC Recomp)", (dn && *dn) ? dn : "Universal NS2 Title");
+    swprintf(title_w, sizeof title_w / sizeof title_w[0], L"%hs", (dn && *dn) ? dn : "Universal NS2 Title");
     g_hwnd = CreateWindowExW(0, wc.lpszClassName, title_w, WND_STYLE, CW_USEDEFAULT, CW_USEDEFAULT, ow, oh, NULL,
                              NULL, inst, NULL);
     if (!g_hwnd) {

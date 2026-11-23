@@ -1415,7 +1415,7 @@ static uint32_t *spv_override(const uint32_t *w, uint64_t words, uint64_t *out_w
     return NULL;
 }
 
-// DKB_FMZ=vertex|all (debug workaround for #75, off by default): NVIDIA's fused-multiply-zero rule (the DX9 rule, 0 * x = 0
+// DKB_FMZ=0|vertex|all (default all; workaround for #75): NVIDIA's fused-multiply-zero rule (the DX9 rule, 0 * x = 0
 // even for Inf and NaN) for 32-bit float scalar and vector OpFMul and GLSL.std.450 Fma. Each such instruction
 //   r = a * b       becomes   t = a * b;     r = (a == 0 || b == 0) ? 0 : t
 //   r = fma(a,b,c)  becomes   t = fma(a,b,c); r = (a == 0 || b == 0) ? c : t
@@ -1442,6 +1442,8 @@ static uint32_t *spirv_fmz(const uint32_t *w, uint64_t n, int vertex_only, uint6
         else if (op == SPV_OP_TYPE_FLOAT && len >= 3 && a[0] < bound && a[1] == 32) f32[a[0]] = 1, comps[a[0]] = 1;
         else if (op == SPV_OP_TYPE_VECTOR && len == 4 && a[0] < bound && a[1] < bound && f32[a[1]] && a[2] >= 2 && a[2] <= 4)
             f32[a[0]] = 1, comps[a[0]] = a[2];
+        else if (op == SPV_OP_TYPE_VECTOR && len == 4 && a[0] < bound && boolt[1] && a[1] == boolt[1] && a[2] >= 2 && a[2] <= 4)
+            boolt[a[2]] = a[0];
         else if (op == SPV_OP_CONSTANT_NULL && len == 3 && a[0] < bound) nullc[a[0]] = a[1];
         else if (op == SPV_OP_FUNCTION) {
             if (!fn_at) fn_at = i;
@@ -1511,9 +1513,9 @@ static VkShaderModule make_module_linked(const GfxShader *src, const uint32_t *w
     static int fmz_mode = -1;   // 0 off, 1 vertex stage only, 2 every stage
     if (fmz_mode < 0) {
         const char *e = cfg_get("TOTK_FMZ");
-        // On by default for vertex stages (#75): the end-of-tutorial cutscene loses the NVIDIA device without it.
-        fmz_mode = !e ? 1 : !strcmp(e, "0") || !*e ? 0 : !strcmp(e, "vertex") ? 1 : !strcmp(e, "all") ? 2 : 1;
-        if (e && *e && strcmp(e, "0") && strcmp(e, "vertex") && strcmp(e, "all")) rt_log("vk: DKB_FMZ=%s ignored, using vertex (use 0, vertex or all)", e);
+        // On by default for all stages (#75 vertex NaN device loss; fragment normalize(0)/fma(0, Inf, base) black albedo).
+        fmz_mode = !e ? 2 : !strcmp(e, "0") || !*e ? 0 : !strcmp(e, "vertex") ? 1 : !strcmp(e, "all") ? 2 : 2;
+        if (e && *e && strcmp(e, "0") && strcmp(e, "vertex") && strcmp(e, "all")) rt_log("vk: DKB_FMZ=%s ignored, using all (use 0, vertex or all)", e);
     }
     // DKB_FMZ_SEL=<mask>:<value> (hex, bisection aid for #75): only modules whose FNV-1a 64 hash before the rewrite
     // satisfies (hash & mask) == value get the FMZ rewrite, so a run can cover a fixed half, quarter, ... of them.
@@ -1768,10 +1770,14 @@ static int geometry_interface(const GfxShader *s, uint32_t storage, uint32_t ver
         else if (op == 71 && n >= 3 && a[0] < bound) {
             GeometryId *d = &id[a[0]];
             if (a[1] == 30) { if (n != 4 || a[2] >= 32 || d->location) goto done; d->location = a[2] + 1; }
-            else if (a[1] == 11) { if (n != 4 || (a[2] >= 64 && a[2] != 4420) || d->builtin) goto done; d->builtin = a[2] + 1; }
+            else if (a[1] == 11) {
+                if (n != 4 || d->builtin) goto done;
+                if (a[2] >= 64 && a[2] != 4420) d->unsupported = 1;
+                else d->builtin = a[2] + 1;
+            }
             else if (a[1] == 31) d->component = 1;
             else if (a[1] == 2) d->block = 1;
-            else if (a[1] == 14) d->flat = d->interpolation = 1;
+            else if (a[1] == 14) d->flat = 1;
             else if (a[1] == 13 || a[1] == 16 || a[1] == 17) d->interpolation = 1;
             else if (a[1] == 18) d->invariant = 1;
             else if (a[1] == 15 || a[1] == 5271 || a[1] == 5285) goto done;
@@ -1794,9 +1800,9 @@ static int geometry_interface(const GfxShader *s, uint32_t storage, uint32_t ver
         if (var->storage != storage) continue;
         uint32_t type = id[var->type].x;
         if (!type || type >= bound || var->component || var->unsupported ||
-            (var->builtin && var->interpolation)) goto done;
+            (var->builtin && (var->interpolation || (var->flat && !(stage == GFX_STAGE_FS && storage == 1))))) goto done;
         if (var->builtin == 42 || var->builtin == 4421) {
-            if (stage != GFX_STAGE_GS || storage != 1 ||
+            if ((stage != GFX_STAGE_GS && stage != GFX_STAGE_FS) || storage != 1 ||
                 !geometry_system_input(id, bound, var, type, &out->system_inputs)) goto done;
             continue;
         }
@@ -1809,8 +1815,8 @@ static int geometry_interface(const GfxShader *s, uint32_t storage, uint32_t ver
             if (!type || type >= bound) goto done;
         } else if (stage == GFX_STAGE_GS && storage == 1 && var->builtin != 8 && var->builtin != 9) goto done;
         if (id[type].op == 30) {
-            if (!id[type].block || id[type].unsupported || id[type].invariant || id[type].interpolation ||
-                var->interpolation || var->location || var->builtin ||
+            if (!id[type].block || id[type].unsupported || id[type].invariant || id[type].flat || id[type].interpolation ||
+                var->flat || var->interpolation || var->location || var->builtin ||
                 !id[type].y || id[type].y > 16 || out->block_members) goto done;
             out->block_members = (uint8_t)id[type].y;
             out->block_invariant = var->invariant;
@@ -1984,7 +1990,25 @@ static const char *geometry_validate(const VkPipeState *s, const VkPhysicalDevic
     }
     if (distance_components > limits->maxCombinedClipAndCullDistances)
         return "geometry combined input/output distance device limit";
-    if (!geometry_link(&vo, &gi)) return "vertex-to-geometry varying mismatch";
+    uint32_t vs_missing = gi.mask & ~vo.mask;
+    if (vs_missing) {
+        for (unsigned i = 0; i < 32; i++) if (vs_missing >> i & 1) {
+            if (gi.io[i].packed || gi.io[i].scalar_bits != 32 || gi.io[i].type > GFX_TYPE_UINT || gi.invariant[i])
+                return "vertex-to-geometry varying mismatch";
+            vo.mask |= 1u << i;
+            vo.io[i] = gi.io[i];
+            vo.components += gi.io[i].comps ? gi.io[i].comps : 4;
+        }
+    }
+    if (!geometry_link(&vo, &gi)) {
+        for (unsigned i = 0; i < 32; i++) if ((gi.mask >> i & 1) &&
+            (!(vo.mask >> i & 1) || memcmp(&vo.io[i], &gi.io[i], sizeof vo.io[i]) || vo.invariant[i] != gi.invariant[i])) {
+            LOG_ONCE("vk_pipeline: VS->GS varying mismatch at loc %u (vo.mask=%#x gi.mask=%#x vs type=%u comps=%u inv=%u gs type=%u comps=%u inv=%u)",
+                     i, vo.mask, gi.mask, vo.io[i].type, vo.io[i].comps, vo.invariant[i], gi.io[i].type, gi.io[i].comps, gi.invariant[i]);
+            break;
+        }
+        return "vertex-to-geometry varying mismatch";
+    }
     if (!geometry_builtin_link(&vo, &gi)) return "vertex-to-geometry built-in block mismatch";
     uint64_t need = gi.builtin_mask & ~generated;
     if ((need & ~vo.builtin_mask) || !(go.builtin_mask & 1)) return "geometry per-vertex built-in mismatch";
@@ -2532,6 +2556,18 @@ static VkPipeline create_graphics(const VkPipeState *s, const GKey *k, const Lay
             vpatched = spirv_add_outputs(vcode, vw, missing, fin, &n2);
             if (!vpatched) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs (mask %#x)", missing);
             else vcode = vpatched, vw = n2;
+        }
+    }
+    if (s->gs && !k->gs_passthrough && !has_tess && !vpatched) {
+        GfxShaderIo gin[32], vout[32];
+        uint32_t need = gfx_shader_inputs(s->gs, gin), have = gfx_shader_outputs(s->vs, vout), missing = 0;
+        for (int i = 0; i < 32; i++)
+            if ((need >> i & 1) && !gin[i].packed && !(have >> i & 1)) missing |= 1u << i;
+        if (missing) {
+            uint64_t n2 = 0;
+            vpatched = spirv_add_outputs(vcode, vw, missing, gin, &n2);
+            if (!vpatched) LOG_ONCE("vk_pipeline: cannot add missing vertex outputs for GS (mask %#x)", missing);
+            else vcode = vpatched, vw = n2, v_added = missing;
         }
     }
     if (s->fs) {

@@ -155,7 +155,13 @@ static void vsync_main(void *arg) {
         if (now > due + 100000000ull) {                  // the process stalled: restart the schedule, no catch-up burst
             g_vs_start_ns = (int64_t)(now - (n + 1) * VSYNC_NS / VSYNC_HZ);
         } else if (due > now) {
-            plat_wait_ns(due - now);
+            if (due - now > 1500000ull) plat_wait_ns(due - now - 1000000ull);
+            for (;;) {
+                now = kern_now_ns();
+                if (now >= due) break;
+                if (due - now > 200000ull) plat_yield();
+                else plat_pause();
+            }
         }
         n++;
         plat_xchg64(&g_ticks, (int64_t)n);
@@ -456,7 +462,7 @@ static VkPresentModeKHR pick_present_mode(VkPhysicalDevice pd) {
     static int logged = -1;   // the mode last logged: a change from the menu shows in the log
     if ((int)got != logged) {
         logged = (int)got;
-        rt_log("gfx: present mode %s (DKB_VK_PRESENT=%s)", name, e);
+        rt_log("gfx: present mode %s (NS2_VK_PRESENT=%s)", name, e);
     }
     return got;
 }

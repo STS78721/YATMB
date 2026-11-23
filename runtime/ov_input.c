@@ -151,10 +151,13 @@ static void ov_controller_support_arg_default(Cpu *c) {
 }
 
 // void SetNpadJoyHoldType(NpadJoyHoldType type)
+static int hold_type = 0;
 static void ov_hold_type(Cpu *c) {
     int64_t t = (int32_t)arg_x(c, 0);
     if (t < 0 || t > 1) rt_fatal("nn::hid::SetNpadJoyHoldType: invalid hold type %lld", (long long)t);
+    hold_type = (int)t;
 }
+static void ov_get_hold_type(Cpu *c) { ret_x(c, (uint32_t)hold_type); }
 
 // void DisconnectNpad(const NpadIdType &id): only the controller in use (handheld mode disconnects player 1)
 static void ov_disconnect(Cpu *c) {
@@ -200,6 +203,16 @@ static void ov_mouse_states(Cpu *c) {
     ret_x(c, 1);
 }
 
+// void GetMouseState(MouseState *out): a mouse that is not connected
+static void ov_mouse_state(Cpu *c) {
+    MouseState *out = arg_p(c, 0);
+    if (!out) rt_fatal("nn::hid::GetMouseState: null output");
+    plat_mutex_lock(&lock);
+    if (!mouse_ready) rt_fatal("nn::hid::GetMouseState before InitializeMouse");
+    *out = (MouseState){.sampling = ++sample};
+    plat_mutex_unlock(&lock);
+}
+
 // void GetKeyboardState(KeyboardState *out): a keyboard with no key down
 static void ov_keyboard_state(Cpu *c) {
     KeyboardState *out = arg_p(c, 0);
@@ -208,6 +221,19 @@ static void ov_keyboard_state(Cpu *c) {
     if (!keyboard_ready) rt_fatal("nn::hid::GetKeyboardState before InitializeKeyboard");
     *out = (KeyboardState){.sampling = ++sample};
     plat_mutex_unlock(&lock);
+}
+
+// int GetKeyboardStates(KeyboardState *out, int count): a keyboard with no key down
+static void ov_keyboard_states(Cpu *c) {
+    KeyboardState *out = arg_p(c, 0);
+    int max = (int)arg_x(c, 1);
+    if (max <= 0) { ret_x(c, 0); return; }
+    if (!out) rt_fatal("nn::hid::GetKeyboardStates: null output");
+    plat_mutex_lock(&lock);
+    if (!keyboard_ready) rt_fatal("nn::hid::GetKeyboardStates before InitializeKeyboard");
+    *out = (KeyboardState){.sampling = ++sample};
+    plat_mutex_unlock(&lock);
+    ret_x(c, 1);
 }
 
 // ---- vibration and six-axis sensor (MacNativeGames hid_feedback.c)
@@ -718,13 +744,16 @@ HOST_OVERRIDE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyLeftStateEiRKj", ov_state
 HOST_OVERRIDE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadJoyRightStateEiRKj", ov_states_joycon);
 HOST_OVERRIDE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj", ov_states_handheld);
 HOST_OVERRIDE("_ZN2nn3hid18SetNpadJoyHoldTypeENS0_15NpadJoyHoldTypeE", ov_hold_type);
+HOST_OVERRIDE("_ZN2nn3hid18GetNpadJoyHoldTypeEv", ov_get_hold_type);
 HOST_OVERRIDE("_ZN2nn3hid14DisconnectNpadERKj", ov_disconnect);
 HOST_OVERRIDE("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE",
               ov_controller_support);
 HOST_OVERRIDE("_ZN2nn3hid15InitializeMouseEv", ov_initialize_mouse);
 HOST_OVERRIDE("_ZN2nn3hid18InitializeKeyboardEv", ov_initialize_keyboard);
+HOST_OVERRIDE("_ZN2nn3hid13GetMouseStateEPNS0_10MouseStateE", ov_mouse_state);
 HOST_OVERRIDE("_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEi", ov_mouse_states);
 HOST_OVERRIDE("_ZN2nn3hid16GetKeyboardStateEPNS0_13KeyboardStateE", ov_keyboard_state);
+HOST_OVERRIDE("_ZN2nn3hid17GetKeyboardStatesEPNS0_13KeyboardStateEi", ov_keyboard_states);
 HOST_OVERRIDE("_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjNS_4util10BitFlagSetILi32ENS0_"
               "12NpadStyleTagEEE", ov_vibration_handles);
 HOST_OVERRIDE("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_"

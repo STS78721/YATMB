@@ -212,9 +212,11 @@ static float menu_scale(uint32_t h) {
 
 static int menu_theme_kind(void) {
     const char *v = cfg_value("NS2_MENU_THEME");
-    if (!strcmp(v, "light")) return mkw_theme::THEME_LIGHT;
-    if (!strcmp(v, "dark")) return mkw_theme::THEME_DARK;
-    return mkw_theme::THEME_TENNIS;
+    if (!v || !*v) v = game_profile()->default_menu_theme;
+    if (v && !strcmp(v, "storybook")) return mkw_theme::THEME_STORYBOOK;
+    if (v && !strcmp(v, "tennis")) return mkw_theme::THEME_TENNIS;
+    if (v && !strcmp(v, "light")) return mkw_theme::THEME_LIGHT;
+    return mkw_theme::THEME_DARK;
 }
 
 // Switch 2 System Settings style (ui/theme.h): Tennis Court (default), Light, or Dark.
@@ -253,7 +255,7 @@ static void make_context(void) {
     io.IniFilename = nullptr;
     io.LogFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
-    io.BackendPlatformName = "dkb_menu";
+    io.BackendPlatformName = "ns2_menu";
     style_init(g_base_style);
     ImGui::GetStyle() = g_base_style;
     g_ctx_ok = 1;
@@ -427,8 +429,8 @@ static void test_parse(void) {
                 TestSet &t = g_test.sets[g_test.n_sets++];
                 t.frame = f;
                 int kn = (int)(eq - s), vn = (int)(s + n - eq - 1);
-                bool has_pfx = !strncmp(s, "NS2_", 4) || !strncmp(s, "TOTK_", 5) || !strncmp(s, "DKB_", 4) ||
-                               !strncmp(s, "MKW_", 4) || !strncmp(s, "MTF_", 4);
+                bool has_pfx = !strncmp(s, "NS2_", 4) || !strncmp(s, "YATMB_", 6) || !strncmp(s, "TOTK_", 5) ||
+                               !strncmp(s, "DKB_", 4) || !strncmp(s, "MKW_", 4) || !strncmp(s, "MTF_", 4);
                 snprintf(t.key, sizeof t.key, "%s%.*s", has_pfx ? "" : "NS2_", kn, s);
                 snprintf(t.value, sizeof t.value, "%.*s", vn, eq + 1);
             }
@@ -727,13 +729,40 @@ static void reset_all(void) {
     rt_log("menu: reset %d settings to their defaults", done);
 }
 
+static void row_menu_theme(void) {
+    const char *def = game_profile()->default_menu_theme;
+    if (!def || !*def) def = "dark";
+    bool is_sb = !strcmp(def, "storybook");
+    bool is_tn = !strcmp(def, "tennis");
+    const char *vals[3], *names[3];
+    int n = 0;
+    if (is_sb) {
+        vals[n] = "";      names[n++] = menu_text(UI_MENU_THEME_STORYBOOK);
+        vals[n] = "light"; names[n++] = menu_text(UI_MENU_THEME_LIGHT);
+        vals[n] = "dark";  names[n++] = menu_text(UI_MENU_THEME_DARK);
+    } else if (is_tn) {
+        vals[n] = "";      names[n++] = menu_text(UI_MENU_THEME_TENNIS);
+        vals[n] = "light"; names[n++] = menu_text(UI_MENU_THEME_LIGHT);
+        vals[n] = "dark";  names[n++] = menu_text(UI_MENU_THEME_DARK);
+    } else {
+        vals[n] = "";      names[n++] = menu_text(UI_MENU_THEME_DARK);
+        vals[n] = "light"; names[n++] = menu_text(UI_MENU_THEME_LIGHT);
+    }
+    const char *now = cfg_value("NS2_MENU_THEME");
+    int cur = 0;
+    if (!strcmp(now, "light")) cur = 1;
+    else if (!strcmp(now, "dark") && n > 2) cur = 2;
+    else if (!*now || !strcmp(now, def)) cur = 0;
+    opt_choice_list("NS2_MENU_THEME", UI_MENU_THEME, vals, names, n,
+                    is_sb ? UI_MENU_THEME_DESC_STORYBOOK : UI_MENU_THEME_DESC, cur);
+}
+
 static void tab_system(float scale) {
     opt_begin("##system", scale);
     row_game_lang();
     static const UiTextId langs[] = {UI_MENU_MENU_LANG_AUTO, UI_MENU_LANGNAME_EN, UI_MENU_LANGNAME_RU};
     opt_choice("NS2_MENU_LANG", UI_MENU_MENU_LANG, langs, 3, UI_MENU_MENU_LANG_DESC);
-    static const UiTextId themes[] = {UI_MENU_THEME_TENNIS, UI_MENU_THEME_LIGHT, UI_MENU_THEME_DARK};
-    opt_choice("NS2_MENU_THEME", UI_MENU_THEME, themes, 3, UI_MENU_THEME_DESC);
+    row_menu_theme();
     bool ask = opt_button("##reset", UI_MENU_RESET, UI_MENU_RESET_DESC);
     opt_end();
     if (ask) ImGui::OpenPopup("##reset_confirm");   // at the level BeginPopupModal looks it up
@@ -952,6 +981,169 @@ static void draw_shadow_racket_motif(ImDrawList *dl, ImVec2 o, float W, float H,
     }
 }
 
+static void draw_star_5(ImDrawList *dl, ImVec2 c, float r_out, float r_in, ImU32 fill, ImU32 stroke, float thick) {
+    ImVec2 pts[10];
+    for (int i = 0; i < 10; i++) {
+        float a = -1.5707963f + i * (3.14159265f / 5.0f);
+        float r = (i & 1) ? r_in : r_out;
+        pts[i] = ImVec2(c.x + cosf(a) * r, c.y + sinf(a) * r);
+    }
+    // Star is concave: draw 5 triangles from center to adjacent perimeter pairs
+    for (int i = 0; i < 10; i++)
+        dl->AddTriangleFilled(c, pts[i], pts[(i + 1) % 10], fill);
+    if (thick > 0.0f) dl->AddPolyline(pts, 10, stroke, ImDrawFlags_Closed, thick);
+}
+
+static void draw_spotted_egg(ImDrawList *dl, ImVec2 c, float rx, float ry, float angle, float alpha_f, float outline_px) {
+    int a_full = (int)lroundf(255.0f * alpha_f);
+    if (a_full <= 0) return;
+    float ca = cosf(angle), sa = sinf(angle);
+    auto rot = [&](float x, float y) { return ImVec2(c.x + x * ca - y * sa, c.y + x * sa + y * ca); };
+    // Smooth classic egg contour: narrower crown (y < 0), rounder base (y > 0)
+    constexpr int N = 32;
+    ImVec2 shell[N];
+    for (int i = 0; i < N; i++) {
+        float t = (float)i * (6.2831853f / N);
+        float yn = sinf(t);
+        float taper = 1.0f + 0.14f * yn - 0.05f * yn * yn;
+        shell[i] = rot(cosf(t) * rx * taper, yn * ry);
+    }
+    // Soft shadow behind egg base
+    dl->AddEllipseFilled(ImVec2(c.x + rx * 0.08f, c.y + ry * 0.94f), ImVec2(rx * 0.78f, ry * 0.16f),
+                         IM_COL32(6, 18, 10, (int)(90 * alpha_f)), 0.0f, 20);
+    // Creamy white shell fill + subtle lower-right shading layer
+    dl->AddConvexPolyFilled(shell, N, IM_COL32(252, 253, 246, a_full));
+    ImVec2 shade[N];
+    for (int i = 0; i < N; i++) {
+        float t = (float)i * (6.2831853f / N);
+        float yn = sinf(t);
+        float taper = 1.0f + 0.14f * yn - 0.05f * yn * yn;
+        float x = cosf(t) * rx * taper, y = yn * ry;
+        if (x < 0.0f) x *= 0.65f;
+        if (y < 0.0f) y *= 0.68f;
+        shade[i] = rot(x * 0.94f + rx * 0.06f, y * 0.94f + ry * 0.06f);
+    }
+    dl->AddConvexPolyFilled(shade, N, IM_COL32(224, 236, 224, (int)(75 * alpha_f)));
+    // Classic vibrant green spots (positioned neatly inside the egg silhouette)
+    struct Spot { float ux, uy, sx, sy, rot_a; };
+    static const Spot kSpots[] = {
+        {-0.30f,  0.04f, 0.30f, 0.27f, -0.20f},
+        { 0.34f, -0.26f, 0.24f, 0.22f,  0.30f},
+        { 0.30f,  0.40f, 0.28f, 0.24f, -0.25f},
+        {-0.10f, -0.62f, 0.22f, 0.17f,  0.10f},
+        {-0.46f,  0.52f, 0.20f, 0.18f,  0.35f},
+    };
+    ImU32 spot_col = IM_COL32(58, 206, 54, a_full);
+    ImU32 spot_hi = IM_COL32(106, 232, 88, (int)(120 * alpha_f));
+    for (const auto &s : kSpots) {
+        ImVec2 sc = rot(s.ux * rx, s.uy * ry);
+        dl->AddEllipseFilled(sc, ImVec2(s.sx * rx, s.sy * ry), spot_col, angle + s.rot_a, 18);
+        dl->AddEllipseFilled(ImVec2(sc.x - s.sx * rx * 0.16f, sc.y - s.sy * ry * 0.16f),
+                             ImVec2(s.sx * rx * 0.55f, s.sy * ry * 0.50f), spot_hi, angle + s.rot_a, 14);
+    }
+    // Glossy specular oval upper-left
+    dl->AddEllipseFilled(rot(-0.32f * rx, -0.34f * ry), ImVec2(rx * 0.16f, ry * 0.22f),
+                         IM_COL32(255, 255, 252, (int)(175 * alpha_f)), angle - 0.35f, 16);
+    // Crisp dark forest-green outline
+    dl->AddPolyline(shell, N, IM_COL32(24, 72, 32, a_full), ImDrawFlags_Closed, outline_px);
+}
+
+static void draw_open_storybook(ImDrawList *dl, ImVec2 c, float w, float h, float scale) {
+    // Warm storybook leather cover behind open cream parchment pages + crimson ribbon bookmark
+    float hw = w * 0.5f, hh = h * 0.5f;
+    ImVec2 cover_l[4] = {ImVec2(c.x - hw - 4 * scale, c.y - hh * 0.85f), ImVec2(c.x, c.y - hh * 0.55f),
+                         ImVec2(c.x, c.y + hh + 3 * scale), ImVec2(c.x - hw - 3 * scale, c.y + hh * 0.88f)};
+    ImVec2 cover_r[4] = {ImVec2(c.x, c.y - hh * 0.55f), ImVec2(c.x + hw + 4 * scale, c.y - hh * 0.85f),
+                         ImVec2(c.x + hw + 3 * scale, c.y + hh * 0.88f), ImVec2(c.x, c.y + hh + 3 * scale)};
+    dl->AddConvexPolyFilled(cover_l, 4, IM_COL32(138, 82, 42, 220));
+    dl->AddConvexPolyFilled(cover_r, 4, IM_COL32(118, 68, 34, 220));
+    // Left and right cream parchment pages
+    ImVec2 page_l[4] = {ImVec2(c.x - hw, c.y - hh), ImVec2(c.x, c.y - hh * 0.62f),
+                        ImVec2(c.x, c.y + hh * 0.92f), ImVec2(c.x - hw + 2 * scale, c.y + hh * 0.68f)};
+    ImVec2 page_r[4] = {ImVec2(c.x, c.y - hh * 0.62f), ImVec2(c.x + hw, c.y - hh),
+                        ImVec2(c.x + hw - 2 * scale, c.y + hh * 0.68f), ImVec2(c.x, c.y + hh * 0.92f)};
+    dl->AddConvexPolyFilled(page_l, 4, IM_COL32(248, 238, 212, 230));
+    dl->AddConvexPolyFilled(page_r, 4, IM_COL32(236, 224, 194, 230));
+    dl->AddPolyline(page_l, 4, IM_COL32(168, 128, 76, 180), ImDrawFlags_Closed, 1.2f * scale);
+    dl->AddPolyline(page_r, 4, IM_COL32(168, 128, 76, 180), ImDrawFlags_Closed, 1.2f * scale);
+    // Subtle story text lines on both pages
+    for (int i = 0; i < 3; i++) {
+        float y_off = (-0.28f + i * 0.28f) * hh;
+        dl->AddLine(ImVec2(c.x - hw * 0.78f, c.y + y_off - 3 * scale),
+                    ImVec2(c.x - hw * 0.18f, c.y + y_off + 2 * scale), IM_COL32(158, 134, 96, 125), 1.3f * scale);
+        dl->AddLine(ImVec2(c.x + hw * 0.18f, c.y + y_off + 2 * scale),
+                    ImVec2(c.x + hw * 0.78f, c.y + y_off - 3 * scale), IM_COL32(158, 134, 96, 125), 1.3f * scale);
+    }
+    // Center crease + iconic red ribbon bookmark below spine
+    dl->AddLine(ImVec2(c.x, c.y - hh * 0.62f), ImVec2(c.x, c.y + hh * 0.92f), IM_COL32(126, 94, 56, 185), 1.6f * scale);
+    ImVec2 rib[5] = {ImVec2(c.x - 3.5f * scale, c.y + hh * 0.75f), ImVec2(c.x + 3.5f * scale, c.y + hh * 0.75f),
+                     ImVec2(c.x + 3.5f * scale, c.y + hh + 12 * scale), ImVec2(c.x, c.y + hh + 8 * scale),
+                     ImVec2(c.x - 3.5f * scale, c.y + hh + 12 * scale)};
+    dl->AddTriangleFilled(rib[0], rib[1], rib[3], IM_COL32(226, 68, 58, 235));
+    dl->AddTriangleFilled(rib[0], rib[3], rib[4], IM_COL32(212, 54, 46, 235));
+    dl->AddTriangleFilled(rib[1], rib[2], rib[3], IM_COL32(198, 48, 40, 235));
+}
+
+static void draw_storybook_motif(ImDrawList *dl, ImVec2 o, float W, float H, float head_h, float foot_h,
+                                 float side_w, float gap_left, float gap_right, float tabs_bottom,
+                                 float pills_top, float pills_right, float scale) {
+    float body_y = o.y + head_h, body_h = H - head_h - foot_h;
+    // 1. Header bar: golden storybook trim line + floating golden stars strictly inside open gap between title & version
+    dl->PushClipRect(o, ImVec2(o.x + W, o.y + head_h), true);
+    dl->AddLine(ImVec2(o.x, o.y + head_h - 1.5f * scale), ImVec2(o.x + W, o.y + head_h - 1.5f * scale),
+                IM_COL32(246, 206, 92, 115), 2.0f * scale);
+    float gap_w = gap_right - gap_left;
+    if (gap_w >= 76 * scale) {
+        float gx = (gap_left + gap_right) * 0.5f;
+        dl->AddCircleFilled(ImVec2(gx, o.y + head_h * 0.5f), fminf(gap_w * 0.38f, head_h * 0.9f),
+                            IM_COL32(96, 226, 68, 16), 28);
+        draw_star_5(dl, ImVec2(gx, o.y + head_h * 0.44f), 8.0f * scale, 3.6f * scale,
+                    IM_COL32(255, 220, 88, 195), IM_COL32(170, 118, 28, 160), 1.0f * scale);
+        draw_star_5(dl, ImVec2(gx - 20 * scale, o.y + head_h * 0.58f), 5.2f * scale, 2.4f * scale,
+                    IM_COL32(255, 228, 118, 160), IM_COL32(170, 118, 28, 130), 0.9f * scale);
+        draw_star_5(dl, ImVec2(gx + 20 * scale, o.y + head_h * 0.56f), 5.2f * scale, 2.4f * scale,
+                    IM_COL32(255, 228, 118, 160), IM_COL32(170, 118, 28, 130), 0.9f * scale);
+    }
+    dl->PopClipRect();
+
+    // 2. Sidebar emblem: full open Mysterious Book + spotted egg when vertical gap permits; compact beside L/R otherwise
+    dl->PushClipRect(ImVec2(o.x, body_y), ImVec2(o.x + side_w, body_y + body_h), true);
+    float free_h = pills_top - tabs_bottom;
+    if (free_h >= 110 * scale) {
+        float cx = o.x + side_w * 0.5f, cy = tabs_bottom + free_h * 0.52f;
+        float k = fminf(1.0f, free_h / (132.0f * scale));
+        dl->AddCircleFilled(ImVec2(cx, cy - 4 * scale * k), 52 * scale * k, IM_COL32(96, 226, 68, 18), 32);
+        dl->AddCircleFilled(ImVec2(cx, cy - 8 * scale * k), 34 * scale * k, IM_COL32(255, 224, 108, 18), 28);
+        draw_open_storybook(dl, ImVec2(cx, cy + 14 * scale * k), 88 * scale * k, 32 * scale * k, scale * k);
+        draw_spotted_egg(dl, ImVec2(cx, cy - 12 * scale * k), 17.5f * scale * k, 22.5f * scale * k, -0.08f, 0.98f,
+                         2.0f * scale * k);
+        draw_star_5(dl, ImVec2(cx - 36 * scale * k, cy - 18 * scale * k), 7.5f * scale * k, 3.4f * scale * k,
+                    IM_COL32(255, 224, 88, 220), IM_COL32(168, 114, 24, 190), 1.1f * scale * k);
+        draw_star_5(dl, ImVec2(cx + 36 * scale * k, cy - 20 * scale * k), 7.0f * scale * k, 3.2f * scale * k,
+                    IM_COL32(255, 224, 88, 220), IM_COL32(168, 114, 24, 190), 1.1f * scale * k);
+        draw_star_5(dl, ImVec2(cx + 24 * scale * k, cy - 38 * scale * k), 4.8f * scale * k, 2.2f * scale * k,
+                    IM_COL32(255, 238, 148, 185), IM_COL32(168, 114, 24, 140), 0.9f * scale * k);
+    } else {
+        // Compact emblem cleanly positioned right of L/R pills, strictly below tabs_bottom
+        float avail_w = (o.x + side_w - 16 * scale) - (pills_right + 14 * scale);
+        float avail_h = (body_y + body_h - 10 * scale) - (tabs_bottom + 4 * scale);
+        if (avail_w >= 58 * scale && avail_h >= 40 * scale) {
+            float k = fminf(0.58f, fminf(avail_w / (108.0f * scale), avail_h / (78.0f * scale)));
+            float cx = pills_right + 14 * scale + avail_w * 0.56f;
+            float cy = (tabs_bottom + 4 * scale + body_y + body_h - 12 * scale) * 0.5f;
+            dl->AddCircleFilled(ImVec2(cx, cy), 44 * scale * k, IM_COL32(96, 226, 68, 18), 28);
+            draw_open_storybook(dl, ImVec2(cx, cy + 10 * scale * k), 84 * scale * k, 30 * scale * k, scale * k);
+            draw_spotted_egg(dl, ImVec2(cx, cy - 10 * scale * k), 16.5f * scale * k, 21.0f * scale * k, -0.08f, 0.98f,
+                             2.0f * scale * k);
+            draw_star_5(dl, ImVec2(cx - 32 * scale * k, cy - 14 * scale * k), 7.0f * scale * k, 3.2f * scale * k,
+                        IM_COL32(255, 224, 88, 215), IM_COL32(168, 114, 24, 180), 1.0f * scale * k);
+            draw_star_5(dl, ImVec2(cx + 32 * scale * k, cy - 16 * scale * k), 6.5f * scale * k, 3.0f * scale * k,
+                        IM_COL32(255, 224, 88, 215), IM_COL32(168, 114, 24, 180), 1.0f * scale * k);
+        }
+    }
+    dl->PopClipRect();
+}
+
 static void layout_menu(uint32_t w, uint32_t h, float scale) {
     using namespace mkw_theme;
     const RtGameProfile *gp = game_profile();
@@ -972,17 +1164,26 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
     float head_h = floorf(fs * 3.1f), foot_h = floorf(fs * 3.3f), side_w = floorf(fminf(W * 0.26f, 380 * scale));
     float body_y = o.y + head_h, body_h = H - head_h - foot_h;
 
-    // title bar: an accent bar, the game title, the page title, and the version on the right
+    // title bar: an accent mark (spotted egg on storybook theme), the game title, the page title, and the version
+    int cur_theme = menu_theme_kind();
     dl->AddRectFilled(o, ImVec2(o.x + W, o.y + head_h), kHeader, rounding, ImDrawFlags_RoundCornersTop);
     dl->AddLine(ImVec2(o.x, o.y + head_h - 0.5f), ImVec2(o.x + W, o.y + head_h - 0.5f), kDivider, 1.0f);
     float tfs = fs * 1.3f, ty = o.y + (head_h - tfs) * 0.5f;
-    dl->AddRectFilled(ImVec2(o.x + pad, o.y + head_h * 0.27f), ImVec2(o.x + pad + 6 * scale, o.y + head_h * 0.73f),
-                      kAccent, 3 * scale);
     float tx = o.x + pad + 20 * scale;
+    if (cur_theme == THEME_STORYBOOK) {
+        draw_spotted_egg(dl, ImVec2(o.x + pad + 11 * scale, o.y + head_h * 0.5f),
+                         head_h * 0.22f, head_h * 0.28f, -0.07f, 1.0f, 1.8f * scale);
+        tx = o.x + pad + 34 * scale;
+    } else {
+        dl->AddRectFilled(ImVec2(o.x + pad, o.y + head_h * 0.27f), ImVec2(o.x + pad + 6 * scale, o.y + head_h * 0.73f),
+                          kAccent, 3 * scale);
+    }
     const char *brand = gp->display_name;
     dl->AddText(font, tfs, ImVec2(tx, ty), kText, brand);
     tx += font->CalcTextSizeA(tfs, FLT_MAX, 0, brand).x + 14 * scale;
-    dl->AddText(font, fs, ImVec2(tx, o.y + (head_h - fs) * 0.5f + fs * 0.08f), kTextSoft, menu_text(UI_MENU_TITLE));
+    const char *page_title = menu_text(UI_MENU_TITLE);
+    dl->AddText(font, fs, ImVec2(tx, o.y + (head_h - fs) * 0.5f + fs * 0.08f), kTextSoft, page_title);
+    float title_right = tx + font->CalcTextSizeA(fs, FLT_MAX, 0, page_title).x + 16 * scale;
     char version[96], gbuf[24];
     const char *game_ver = (rt_game_display_version && rt_game_display_version[0]) ? rt_game_display_version : nullptr;
     if (!game_ver) {
@@ -994,19 +1195,27 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
     }
     snprintf(version, sizeof version, menu_text(UI_MENU_VERSION), rt_port_version, game_ver);
     float vw = font->CalcTextSizeA(fs * 0.85f, FLT_MAX, 0, version).x;
-    dl->AddText(font, fs * 0.85f, ImVec2(o.x + W - pad - vw, o.y + (head_h - fs * 0.85f) * 0.5f), kTextDim, version);
+    float ver_left = o.x + W - pad - vw;
+    dl->AddText(font, fs * 0.85f, ImVec2(ver_left, o.y + (head_h - fs * 0.85f) * 0.5f), kTextDim, version);
 
     // category list
     dl->AddRectFilled(ImVec2(o.x, body_y), ImVec2(o.x + side_w, body_y + body_h), kSidebar);
     dl->AddLine(ImVec2(o.x + side_w - 0.5f, body_y), ImVec2(o.x + side_w - 0.5f, body_y + body_h), kDivider, 1.0f);
-    if (menu_theme_kind() == THEME_TENNIS)
+    float ih = floorf(fs * 2.4f), ix = o.x + 14 * scale, iw = side_w - 28 * scale, iy = body_y + 18 * scale;
+    float ph = fs * 1.1f, py = body_y + body_h - ph - 20 * scale;
+    float pills_w = font->CalcTextSizeA(ph * 0.62f, FLT_MAX, 0, "L").x + ph * 0.9f + 8 * scale +
+                    font->CalcTextSizeA(ph * 0.62f, FLT_MAX, 0, "R").x + ph * 0.9f;
+    float tabs_bottom = iy + TAB_COUNT * (ih + 6 * scale);
+    if (cur_theme == THEME_STORYBOOK)
+        draw_storybook_motif(dl, o, W, H, head_h, foot_h, side_w, title_right, ver_left - 16 * scale,
+                             tabs_bottom, py - 8 * scale, ix + 12 * scale + pills_w, scale);
+    else if (cur_theme == THEME_TENNIS)
         draw_shadow_racket_motif(dl, o, W, H, head_h, foot_h, side_w, scale);
     int step = g_modal || binds_modal()                                                                  ? 0
              : ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_E, false) ? 1
              : ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false) || ImGui::IsKeyPressed(ImGuiKey_Q, false) ? -1
                                                                                                           : 0;
     if (step) g_tab_request = (g_tab + step + TAB_COUNT) % TAB_COUNT;
-    float ih = floorf(fs * 2.4f), ix = o.x + 14 * scale, iw = side_w - 28 * scale, iy = body_y + 18 * scale;
     for (int k = 0; k < TAB_COUNT; k++) {
         ImVec2 a(ix, iy + k * (ih + 6 * scale)), b(ix + iw, a.y + ih);
         ImGui::SetCursorScreenPos(a);
@@ -1025,7 +1234,7 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
         dl->AddText(ImVec2(a.x + 26 * scale, a.y + (ih - fs) * 0.5f), sel ? kAccentText : kText, menu_text(kTabNames[k]));
     }
     {
-        float ph = fs * 1.1f, py = body_y + body_h - ph - 20 * scale, px = ix + 12 * scale;
+        float px = ix + 12 * scale;
         px += hint_pill(dl, ImVec2(px, py), ph, "L") + 8 * scale;
         hint_pill(dl, ImVec2(px, py), ph, "R");
     }

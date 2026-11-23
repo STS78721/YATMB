@@ -1126,10 +1126,18 @@ static void close_directory(uint64_t h) {
 // and ApplicationId are 8-byte structs passed in one register; Uid, ReadOption and WriteOption by reference.
 #define I32(i) ((int32_t)arg_x(c, i))
 #define I64(i) ((int64_t)arg_x(c, i))
-static void ov_open_file(Cpu *c) { ret_x(c, open_file(arg_p(c, 0), arg_p(c, 1), I32(2))); }
+// TOTK_TRACE=fs: entry-type queries and directory opens (with their results), next to the opens fs_trace shows
+static uint32_t traced(const char *what, const char *path, uint32_t r) {
+    if (rt_trace & RT_TRACE_FS) rt_log("fs %s %s -> %#x", what, path ? path : "(null)", r);
+    return r;
+}
+static void ov_open_file(Cpu *c) {
+    uint32_t r = open_file(arg_p(c, 0), arg_p(c, 1), I32(2));
+    ret_x(c, r ? traced("open failed", arg_p(c, 1), r) : r);
+}
 static void ov_file_size(Cpu *c) { ret_x(c, file_size(arg_p(c, 0), arg_x(c, 1))); }
 static void ov_close_file(Cpu *c) { close_file(arg_x(c, 0)); }
-static void ov_entry_type(Cpu *c) { ret_x(c, entry_type(arg_p(c, 0), arg_p(c, 1))); }
+static void ov_entry_type(Cpu *c) { ret_x(c, traced("type", arg_p(c, 1), entry_type(arg_p(c, 0), arg_p(c, 1)))); }
 static void ov_read_file(Cpu *c) { ret_x(c, read_file(arg_p(c, 0), arg_x(c, 1), I64(2), arg_p(c, 3), arg_x(c, 4))); }
 static void ov_read_options(Cpu *c) { ret_x(c, read_file(arg_p(c, 0), arg_x(c, 1), I64(2), arg_p(c, 3), arg_x(c, 4))); }
 static void ov_read_exact(Cpu *c) { ret_x(c, read_exact(arg_x(c, 0), I64(1), arg_p(c, 2), arg_x(c, 3))); }
@@ -1141,7 +1149,9 @@ static void ov_delete_file(Cpu *c) { ret_x(c, delete_file(arg_p(c, 0))); }
 static void ov_rename_file(Cpu *c) { ret_x(c, rename_file(arg_p(c, 0), arg_p(c, 1))); }
 static void ov_create_directory(Cpu *c) { ret_x(c, create_directory(arg_p(c, 0))); }
 static void ov_delete_recursive(Cpu *c) { ret_x(c, delete_recursive(arg_p(c, 0))); }
-static void ov_open_directory(Cpu *c) { ret_x(c, open_directory(arg_p(c, 0), arg_p(c, 1), I32(2))); }
+static void ov_open_directory(Cpu *c) {
+    ret_x(c, traced("opendir", arg_p(c, 1), open_directory(arg_p(c, 0), arg_p(c, 1), I32(2))));
+}
 static void ov_read_directory(Cpu *c) { ret_x(c, read_directory(arg_p(c, 0), arg_p(c, 1), arg_x(c, 2), I64(3))); }
 static void ov_get_dir_entry_count(Cpu *c) { ret_x(c, get_directory_entry_count(arg_p(c, 0), arg_x(c, 1))); }
 static void ov_close_directory(Cpu *c) { close_directory(arg_x(c, 0)); }

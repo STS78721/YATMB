@@ -105,7 +105,7 @@ if WIN:
     RT_FLAGS.append('-D_WIN32_WINNT=0x0A00')
     # -Xlinker passes the map path as one argument; -Wl, would split it at any comma in the build dir path
     LINK_FLAGS = ['-fuse-ld=lld', '-Wl,--stack,16777216']   # linker map is added per target in ninja_file()
-    LINK_LIBS = ['-lpsapi', '-lbcrypt', '-lvulkan-1', '-luser32', '-lgdi32', '-ldwmapi', '-limm32', '-lwinmm', '-lSDL3', '-lopus', '-l:libvpx.a', '-l:libdav1d.a', '-l:libzstd.a', '-l:libstdc++.a', '-l:libwinpthread.a']   # Vulkan back end; libvpx static (movies); libzstd static (resolution.c)
+    LINK_LIBS = ['-lpsapi', '-lbcrypt', '-lvulkan-1', '-luser32', '-lgdi32', '-ldwmapi', '-limm32', '-lwinmm', '-lmfplat', '-lmfuuid', '-lole32', '-lSDL3', '-lopus', '-l:libvpx.a', '-l:libdav1d.a', '-l:libzstd.a', '-l:libstdc++.a', '-l:libwinpthread.a']   # Vulkan back end; libvpx static (movies); Media Foundation (H.264 movies, h264_win.c); libzstd static (resolution.c)
     VMA_INCLUDE = UCRT.parent / 'include' / 'vma'   # vk_mem_alloc.h; MSYS2 package vulkan-memory-allocator
 else:
     # -no-pie: the lifted modules' function tables (hundreds of thousands of pointers) need no load-time relocation.
@@ -140,7 +140,7 @@ def vma_include():
 
 
 # --toolchain: an llvm-mingw tree. The libraries, headers and DLLs MSYS2 supplies come from the deps directory instead.
-LLVM_LINK_LIBS = ['-lpsapi', '-lbcrypt', '-luser32', '-lgdi32', '-ldwmapi', '-limm32', '-lwinmm', '-lvulkan-1', '-lSDL3', '-lopus',
+LLVM_LINK_LIBS = ['-lpsapi', '-lbcrypt', '-luser32', '-lgdi32', '-ldwmapi', '-limm32', '-lwinmm', '-lmfplat', '-lmfuuid', '-lole32', '-lvulkan-1', '-lSDL3', '-lopus',
                   '-l:libvpx.a', '-l:libdav1d.a', '-l:libzstd.a', '-l:libc++.a', '-l:libc++abi.a', '-l:libunwind.a', '-l:libwinpthread.a']
 DEFAULT_DEPS = ROOT / 'toolchain' / 'deps-mingw'
 # Runtime sources compiled per install, not in the library: romfs.c includes romfs_config.h, patches.c and ov_zstd.c
@@ -153,7 +153,7 @@ WINDRES = UCRT / 'windres.exe'   # runtime/totk.rc: the manifest of totk.exe
 TOOLCHAIN_BIN = None   # llvm-mingw bin directory, set by main() for --toolchain
 DEPS = None            # the deps directory of an llvm-mingw build
 # tools/data/expected-<display version>.json for each build version name.
-DISPLAY_VERSIONS = {'v0': '1.0.0', 'v111': '1.1.1', 'v112': '1.1.2', 'v121': '1.2.1', 'v143': '1.4.3', 'mtf111': '1.1.1', 'mkw180': '1.8.0'}
+DISPLAY_VERSIONS = {'v0': '1.0.0', 'v111': '1.1.1', 'v112': '1.1.2', 'v121': '1.2.1', 'v143': '1.4.3', 'mtf111': '1.1.1', 'mkw180': '1.8.0', 'yoshi102': '1.0.2'}
 
 GiB = 1 << 30
 # Peak commit of one compile, 1.2.1 at -O1 (2026-10-20): 120-180 MiB per ~3 MiB chunk, 568 MiB for main_table.c
@@ -257,7 +257,7 @@ def other_os(name):
     stem = name.rsplit('.', 1)[0]
     if WIN:
         return stem.endswith('_sdl') or name == 'linux.c'
-    return stem.endswith('_win') or name in ('win32.c', 'mtf.rc', 'totk.rc')
+    return stem.endswith('_win') or name == 'win32.c' or name.endswith('.rc')
 
 
 def runtime_sources(skip=()):
@@ -275,7 +275,8 @@ def runtime_object(out, src):
     return out / 'obj' / 'runtime' / rel.with_suffix('.o')
 
 
-def module_glue(layout, linked, hashes, paths, version, title_id=0x040074a01bf12000, short_name='ns2', display_name='Universal NS2 Title'):
+def module_glue(layout, linked, hashes, paths, version, title_id=0x040074a01bf12000, short_name='ns2',
+                display_name='Universal NS2 Title', port_ver=None, display_ver=None):
     """C for build/<version>/modules.c: the layout table, the linked modules' function tables (dispatch.h), the
     expected ExeFS hashes, the game identity/version and the default game paths (host.h)."""
     out = [f'// Module glue written by tools/build_game.py; do not edit. {GENERATED_MARKER}',
@@ -301,14 +302,15 @@ def module_glue(layout, linked, hashes, paths, version, title_id=0x040074a01bf12
     out += ['};', f'const int rt_exefs_sha256_count = {len(hashes)};', '']
     for name in ('exefs', 'romfs', 'profile'):
         out.append(f'const char rt_default_{name}[] = {c_string(paths[name].as_posix())};')
-    if any(k in version.lower() for k in ('mtf', 'mkw', 'dkb', 'oot')):
+    if any(k in version.lower() for k in ('mtf', 'mkw', 'dkb', 'oot', 'yoshi', 'yatmb')):
         number = 0
     else:
         number = int(DISPLAY_VERSIONS[version].replace('.', '')) if version in DISPLAY_VERSIONS else 0   # 1.4.3 -> 143
-    disp_ver = DISPLAY_VERSIONS.get(version, '')
+    disp_ver = display_ver if display_ver else DISPLAY_VERSIONS.get(version, '')
+    p_ver = port_ver if port_ver else port_version()
     out += [f'const uint64_t rt_application_id = {title_id:#x}ull;',
             f'const int rt_game_version = {number};',
-            f'const char rt_port_version[] = {c_string(port_version())};',
+            f'const char rt_port_version[] = {c_string(p_ver)};',
             f'const char rt_game_display_version[] = {c_string(disp_ver)};',
             f'const char rt_game_short_name[] = {c_string(short_name)};',
             f'const char rt_game_display_name[] = {c_string(display_name)};', '']
@@ -322,7 +324,8 @@ def port_version():
     return version.splitlines()[0].strip() if version else 'Alpha 0.1.3'
 
 
-def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=None, make_lib=False, is_mtf=False):
+def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=None, make_lib=False, is_mtf=False,
+               short_name=None, wraps=()):
     """build.ninja text, and the object lists per module. With prebuilt the generated objects already exist in
     out/obj and are link inputs without a compile edge. runtime_lib: a prebuilt library replaces the runtime objects
     except INSTALL_SIDE. make_lib: build only that library, from the runtime objects except INSTALL_SIDE."""
@@ -357,6 +360,8 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
     if is_mtf and 'subsdk0' in mods:
         # Mario Tennis Fever: force internal frame lines (resolution.c __wrap_f_700205e8fc)
         ldflags.append('-Wl,--wrap,f_700205e8fc')
+    for sym in wraps:
+        ldflags.append(f'-Wl,--wrap,{sym}')
     map_stem = Path(EXE).stem if EXE else ('mtf' if is_mtf else 'totk')
     if WIN:
         ldflags += ['-Xlinker', f'"--Map=$builddir/{map_stem}.map"']
@@ -410,12 +415,12 @@ def ninja_file(gen, out, mods, pool_depth, skip=(), prebuilt=False, runtime_lib=
     rt = []
     sources = runtime_sources(skip)
     if WIN:
-        want_rc = 'mtf.rc' if is_mtf else 'totk.rc'
+        want_rc = f'{short_name}.rc' if (short_name and (RUNTIME / f'{short_name}.rc').is_file()) else ('mtf.rc' if is_mtf else 'totk.rc')
         sources = [p for p in sources if p.suffix != '.rc' or p.name == want_rc]
     if make_lib:
-        sources = [p for p in sources if p.name not in INSTALL_SIDE]
+        sources = [p for p in sources if p.name not in INSTALL_SIDE and p.suffix != '.rc']
     elif runtime_lib:
-        sources = [p for p in sources if p.name in INSTALL_SIDE] + [out / 'modules.c']
+        sources = [p for p in sources if p.name in INSTALL_SIDE or p.suffix == '.rc'] + [out / 'modules.c']
     else:
         sources += [out / 'modules.c']
     for src in sources:
@@ -865,7 +870,8 @@ def main():
     missing = [n for n in names if n not in hashes]
     if missing:
         sys.exit(f'{expected}: no exefs_sha256 for {missing}')
-    write_if_changed(out / 'modules.c', module_glue(layout, linked, hashes, paths, args.version, title_id, short_name, display_name))
+    write_if_changed(out / 'modules.c', module_glue(layout, linked, hashes, paths, args.version, title_id, short_name,
+                     display_name, port_ver=exp_data.get('port_version'), display_ver=exp_data.get('display_version')))
     if (paths['romfs'] / 'index.json').is_file():
         count, size, dt = romfs_index.write(paths['romfs'], out)
         print(f'romfs index: {count} files, {mib(size)}, {dt:.1f} s')
@@ -905,7 +911,8 @@ def main():
     if runtime_lib and not runtime_lib.is_file():
         sys.exit(f'{runtime_lib} not found: build it with --make-runtime-lib')
     text, objs, exe = ninja_file(gen, out, mods, jobs, skip, pairs is not None, runtime_lib,
-                                 args.make_runtime_lib, is_mtf=is_mtf)
+                                 args.make_runtime_lib, is_mtf=is_mtf, short_name=short_name,
+                                 wraps=exp_data.get('wraps', ()))
     write_if_changed(out / 'build.ninja', text)
 
     env = dict(os.environ)
@@ -947,7 +954,7 @@ def main():
     )
     if xlate_src:
         xlate_id = xlate_src.with_suffix('.id')
-        stems = ('ns2_xlate',) if is_mtf else ('ns2_xlate', 'totk_xlate')
+        stems = ('ns2_xlate', 'totk_xlate') if (not short_name or short_name == 'totk') else ('ns2_xlate',)
         for stem in stems:
             dst_xlate = exe.parent / f'{stem}{xlate_ext}'
             shutil.copy2(xlate_src, dst_xlate)

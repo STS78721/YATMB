@@ -38,6 +38,15 @@ NVN_API(nvnTexturePoolRegisterTexture) {
     if (!nvn_dpool_snapshot(arg_p(c, 0), 1u << 20, &pool)) rt_fatal("nvn: invalid texture descriptor pool");
     gfx_backend()->texture_register(&pool, (int)arg_x(c, 1), arg_p(c, 2), arg_p(c, 3));
 }
+NVN_API(nvnTexturePoolGetMemoryPool) { ret_x(c, (uintptr_t)((const dpool_t *)arg_p(c, 0))->pool); }
+NVN_API(nvnTexturePoolGetMemoryOffset) { ret_x(c, (uint64_t)((const dpool_t *)arg_p(c, 0))->off); }
+NVN_API(nvnTexturePoolGetSize) { ret_x(c, (uint32_t)((const dpool_t *)arg_p(c, 0))->n); }
+// void nvnTexturePoolRegisterImage(const NVNtexturePool *tp, int id, const NVNtexture *t, const NVNtextureView *v)
+NVN_API(nvnTexturePoolRegisterImage) {
+    dpool_ref pool;
+    if (!nvn_dpool_snapshot(arg_p(c, 0), 1u << 20, &pool)) rt_fatal("nvn: invalid texture descriptor pool");
+    gfx_backend()->texture_register(&pool, (int)arg_x(c, 1), arg_p(c, 2), arg_p(c, 3));
+}
 // NVNboolean nvnSamplerPoolInitialize(NVNsamplerPool *sp, const NVNmemoryPool *p, ptrdiff_t offset, int n)
 NVN_API(nvnSamplerPoolInitialize) {
     dpool_t p = {arg_p(c, 1), (int64_t)arg_x(c, 2), (int32_t)arg_x(c, 3)};
@@ -54,6 +63,15 @@ NVN_API(nvnSamplerPoolRegisterSampler) {
     dpool_ref pool;
     if (!nvn_dpool_snapshot(arg_p(c, 0), 1u << 12, &pool)) rt_fatal("nvn: invalid sampler descriptor pool");
     gfx_backend()->sampler_register(&pool, (int)arg_x(c, 1), &((const samp_t *)arg_p(c, 2))->p);
+}
+NVN_API(nvnSamplerPoolGetMemoryPool) { ret_x(c, (uintptr_t)((const dpool_t *)arg_p(c, 0))->pool); }
+NVN_API(nvnSamplerPoolGetMemoryOffset) { ret_x(c, (uint64_t)((const dpool_t *)arg_p(c, 0))->off); }
+NVN_API(nvnSamplerPoolGetSize) { ret_x(c, (uint32_t)((const dpool_t *)arg_p(c, 0))->n); }
+// void nvnSamplerPoolRegisterSamplerBuilder(const NVNsamplerPool *sp, int id, const NVNsamplerBuilder *b)
+NVN_API(nvnSamplerPoolRegisterSamplerBuilder) {
+    dpool_ref pool;
+    if (!nvn_dpool_snapshot(arg_p(c, 0), 1u << 12, &pool)) rt_fatal("nvn: invalid sampler descriptor pool");
+    gfx_backend()->sampler_register(&pool, (int)arg_x(c, 1), &((const samp_builder_t *)arg_p(c, 2))->p);
 }
 
 // ---------- Texture builder
@@ -199,10 +217,7 @@ static void tex_release(tex_t *o) {
     gfx_backend()->texture_release(o);
 }
 
-// NVNboolean nvnTextureInitialize(NVNtexture *t, const NVNtextureBuilder *b)
-NVN_API(nvnTextureInitialize) {
-    tex_t *o = arg_p(c, 0);
-    const tex_builder_t *s = arg_p(c, 1);
+int nvn_tex_init_host(tex_t *o, const tex_builder_t *s) {
     if (o->magic == NVN_TEX_MAGIC && o->serial) {   // initialized again without Finalize: release the old serial
         NVN_LOG("texture %p initialized again without Finalize (serial %llu released)", (void *)o,
                 (unsigned long long)o->serial);
@@ -227,8 +242,14 @@ NVN_API(nvnTextureInitialize) {
     live_put(o);
     NVN_LOG("Texture %p %ux%ux%u lv%u fmt=%#x tgt=%d flags=%#x size=%#llx", (void *)o, o->d.width, o->d.height,
             o->d.depth, o->d.levels, o->d.format, o->d.target, o->d.flags, (unsigned long long)o->L.size);
-    ret_x(c, 1);
+    return 1;
 }
+
+// NVNboolean nvnTextureInitialize(NVNtexture *t, const NVNtextureBuilder *b)
+NVN_API(nvnTextureInitialize) {
+    ret_x(c, (uint64_t)nvn_tex_init_host(arg_p(c, 0), arg_p(c, 1)));
+}
+NVN_API(nvnTextureGetDeviceNVX) { ret_x(c, (uintptr_t)nvn_default_device()); }
 // void nvnTextureFinalize(NVNtexture *t)
 NVN_API(nvnTextureFinalize) {
     tex_t *o = arg_p(c, 0);
@@ -804,12 +825,16 @@ static uint64_t pace(uint64_t *target, uint64_t now, uint64_t period) {
 }
 
 static void sleep_until(uint64_t deadline) {
+    uint64_t now = kern_now_ns();
+    if (now >= deadline) return;
+    // High-resolution waitable timer to 1 ms before deadline, then brief yield/pause spin to avoid Windows Sleep()
+    // 1-2 ms overshoot that produces 18-20 ms (~55 fps) frame-time dips on 60 fps titles.
+    if (deadline > now + 1500000ull) plat_wait_ns(deadline - now - 1000000ull);
     for (;;) {
-        uint64_t now = kern_now_ns();
+        now = kern_now_ns();
         if (now >= deadline) return;
-        uint64_t d = deadline - now;
-        if (d >= 2000000) plat_sleep_ms((uint32_t)(d / 1000000 - 1));
-        else plat_yield();
+        if (deadline - now > 200000ull) plat_yield();
+        else plat_pause();
     }
 }
 
@@ -860,7 +885,166 @@ NVN_API(nvnQueuePresentTexture) {
     uint64_t slot = now + pace(&o->pace, now, period);
     gfx_backend()->present(t, crop, slot);
     o->ticket[idx] = o->presents;
-    o->avail[idx] = slot + period;
+    // Anchor image availability to the phase-locked pacer grid (o->pace + period) rather than (slot + period):
+    // when a single frame arrives slightly late (now > next, so slot == now while o->pace keeps phase at next),
+    // using slot ratchets every subsequent acquire deadline forward by the overshoot, drifting 60 Hz down to ~59.8 Hz.
+    o->avail[idx] = (o->pace ? o->pace : slot) + period;
     frame_step_present(slot, o->interval);   // frame_rate.c: the real-time step follows the display times
     rt_frame_presented(t, crop, o->presents);
 }
+
+// ---------- Native images (nn::gs::NativeImageHandle -> linear NVNtexture for decode-to-texture video)
+__attribute__((weak)) int codec_native_image_query(uint32_t handle, uint32_t *w, uint32_t *h, uint8_t **guest_buf,
+                                                     size_t *guest_size) {
+    (void)handle, (void)w, (void)h, (void)guest_buf, (void)guest_size;
+    return 0;
+}
+__attribute__((weak)) void codec_native_image_attach(uint32_t handle, uint8_t *mem, size_t size, uint32_t w,
+                                                     uint32_t h, uint32_t stride, int format) {
+    (void)handle, (void)mem, (void)size, (void)w, (void)h, (void)stride, (void)format;
+}
+__attribute__((weak)) void codec_native_image_detach(uint32_t handle, const uint8_t *mem) {
+    (void)handle, (void)mem;
+}
+
+#define NVN_NATIVE_IMG_MAGIC MAGIC('N', 'I', 'M', 'G')
+typedef struct {
+    NVNdevice *dev;    // +0x00
+    uint32_t handle;   // +0x08
+    uint32_t perm;     // +0x0c
+    uint32_t format;   // +0x10
+} native_img_builder_t;
+
+typedef struct {
+    uint32_t magic, handle, perm, format;
+    NVNdevice *dev;
+    uint32_t width, height, stride, pad;
+    uint8_t *buf;
+    size_t buf_size;
+    int owns_buf, pool_init;
+    pool_t pool;
+} native_img_t;
+_Static_assert(sizeof(native_img_t) <= 0x1a0, "native_img_t must fit SDK NVNnativeImage (0x1a0 bytes)");
+
+static void native_img_release(native_img_t *ni) {
+    if (!ni || ni->magic != NVN_NATIVE_IMG_MAGIC) return;
+    codec_native_image_detach(ni->handle, ni->buf);
+    if (ni->pool_init) nvn_pool_fini_host(&ni->pool);
+    if (ni->owns_buf && ni->buf) mem_kernel_free(ni->buf, ni->buf_size);
+    memset(ni, 0, sizeof *ni);
+}
+
+static void ov_nib_set_device(Cpu *c) { ((native_img_builder_t *)arg_p(c, 0))->dev = arg_p(c, 1); }
+static void ov_nib_set_defaults(Cpu *c) {
+    native_img_builder_t *b = arg_p(c, 0);
+    b->handle = 0;
+    b->perm = 0;
+    b->format = 0;
+}
+static void ov_nib_set_handle(Cpu *c) { ((native_img_builder_t *)arg_p(c, 0))->handle = (uint32_t)arg_x(c, 1); }
+static void ov_nib_set_perm(Cpu *c) { ((native_img_builder_t *)arg_p(c, 0))->perm = (uint32_t)arg_x(c, 1); }
+static void ov_nib_set_format(Cpu *c) { ((native_img_builder_t *)arg_p(c, 0))->format = (uint32_t)arg_x(c, 1); }
+static void ov_nib_get_device(Cpu *c) { ret_x(c, (uintptr_t)((const native_img_builder_t *)arg_p(c, 0))->dev); }
+static void ov_nib_get_handle(Cpu *c) { ret_x(c, ((const native_img_builder_t *)arg_p(c, 0))->handle); }
+static void ov_nib_get_perm(Cpu *c) { ret_x(c, ((const native_img_builder_t *)arg_p(c, 0))->perm); }
+static void ov_nib_get_format(Cpu *c) { ret_x(c, ((const native_img_builder_t *)arg_p(c, 0))->format); }
+
+static void ov_ni_init(Cpu *c) {
+    native_img_t *ni = arg_p(c, 0);
+    const native_img_builder_t *b = arg_p(c, 1);
+    if (!ni || !b) { ret_x(c, 0); return; }
+    if (ni->magic == NVN_NATIVE_IMG_MAGIC && ni->pool_init) native_img_release(ni);
+    uint32_t w = 0, h = 0;
+    uint8_t *guest_buf = NULL;
+    size_t guest_size = 0;
+    if (!codec_native_image_query(b->handle, &w, &h, &guest_buf, &guest_size) || !w || !h) {
+        static volatile int32_t n_miss;
+        if (plat_inc32(&n_miss) <= 8) rt_log("nvn: NativeImageInitialize unknown handle %#x", b->handle);
+        memset(ni, 0, sizeof *ni);
+        ret_x(c, 0);
+        return;
+    }
+    uint32_t format = b->format ? b->format : NVN_FORMAT_RGBA8;
+    int bw = 1, bh = 1;
+    int bpb = nvn_fmt_bpb((int)format, &bw, &bh);
+    if (bpb <= 0) bpb = 4;
+    uint32_t stride = (w * (uint32_t)bpb + 31u) & ~31u;
+    size_t need = ((size_t)stride * h + 0xfffu) & ~0xfffu;
+    uint8_t *buf = NULL;
+    int owns_buf = 0;
+    if (guest_buf && (((uintptr_t)guest_buf & 0xfffu) == 0) && (uintptr_t)guest_buf < RT_ADDRESS_LIMIT &&
+        guest_size >= need && !nvn_pool_find((uintptr_t)guest_buf, need)) {
+        buf = guest_buf;
+        mem_thaw((uintptr_t)buf, need);
+    } else {
+        buf = mem_kernel_alloc(need, 0x1000);
+        owns_buf = 1;
+    }
+    memset(ni, 0, sizeof *ni);
+    if (!nvn_pool_init_host(&ni->pool, buf, need, NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED)) {
+        if (owns_buf && buf) mem_kernel_free(buf, need);
+        ret_x(c, 0);
+        return;
+    }
+    ni->magic = NVN_NATIVE_IMG_MAGIC;
+    ni->handle = b->handle;
+    ni->perm = b->perm;
+    ni->format = format;
+    ni->dev = b->dev ? b->dev : nvn_default_device();
+    ni->width = w;
+    ni->height = h;
+    ni->stride = stride;
+    ni->buf = buf;
+    ni->buf_size = need;
+    ni->owns_buf = owns_buf;
+    ni->pool_init = 1;
+    static volatile int32_t n_inits;
+    if (plat_inc32(&n_inits) <= 16)
+        rt_log("nvn: NativeImageInitialize handle=%#x %ux%u fmt=%#x perm=%#x stride=%u (%s)", b->handle, w, h, format,
+               b->perm, stride, owns_buf ? "kernel" : "guest");
+    ret_x(c, 1);
+}
+
+static void ov_ni_fini(Cpu *c) { native_img_release(arg_p(c, 0)); }
+
+static void ov_tex_from_ni(Cpu *c) {
+    tex_t *tex = arg_p(c, 0);
+    const native_img_t *ni = arg_p(c, 1);
+    if (!tex || !ni || ni->magic != NVN_NATIVE_IMG_MAGIC || !ni->pool_init) {
+        ret_x(c, 0);
+        return;
+    }
+    tex_builder_t tb = {0};
+    tb.dev = ni->dev;
+    tb.d.target = NVN_TEXTURE_TARGET_2D;
+    tb.d.format = (int)ni->format;
+    tb.d.flags = NVN_TEXTURE_FLAGS_LINEAR;
+    tb.d.width = ni->width;
+    tb.d.height = ni->height;
+    tb.d.depth = 1;
+    tb.d.levels = 1;
+    tb.d.stride = ni->stride;
+    tb.d.swizzle_r = NVN_TEXTURE_SWIZZLE_R;
+    tb.d.swizzle_g = NVN_TEXTURE_SWIZZLE_G;
+    tb.d.swizzle_b = NVN_TEXTURE_SWIZZLE_B;
+    tb.d.swizzle_a = NVN_TEXTURE_SWIZZLE_A;
+    tb.pool = (pool_t *)&ni->pool;
+    int ok = nvn_tex_init_host(tex, &tb);
+    if (ok) codec_native_image_attach(ni->handle, ni->buf, ni->buf_size, ni->width, ni->height, ni->stride, (int)ni->format);
+    ret_x(c, (uint64_t)ok);
+}
+
+HOST_OVERRIDE("_Z30nvnNativeImageBuilderSetDeviceP21NVNnativeImageBuilderP9NVNdevice", ov_nib_set_device);
+HOST_OVERRIDE("_Z32nvnNativeImageBuilderSetDefaultsP21NVNnativeImageBuilder", ov_nib_set_defaults);
+HOST_OVERRIDE("_Z41nvnNativeImageBuilderSetNativeImageHandleP21NVNnativeImageBuilderN2nn2gs17NativeImageHandleE",
+              ov_nib_set_handle);
+HOST_OVERRIDE("_Z40nvnNativeImageBuilderSetMemoryPermissionP21NVNnativeImageBuilder30NVNnativeImageMemoryPermission",
+              ov_nib_set_perm);
+HOST_OVERRIDE("_Z30nvnNativeImageBuilderSetFormatP21NVNnativeImageBuilder9NVNformat", ov_nib_set_format);
+HOST_OVERRIDE("_Z30nvnNativeImageBuilderGetDevicePK21NVNnativeImageBuilder", ov_nib_get_device);
+HOST_OVERRIDE("_Z41nvnNativeImageBuilderGetNativeImageHandlePK21NVNnativeImageBuilder", ov_nib_get_handle);
+HOST_OVERRIDE("_Z40nvnNativeImageBuilderGetMemoryPermissionPK21NVNnativeImageBuilder", ov_nib_get_perm);
+HOST_OVERRIDE("_Z30nvnNativeImageBuilderGetFormatPK21NVNnativeImageBuilder", ov_nib_get_format);
+HOST_OVERRIDE("_Z24nvnNativeImageInitializeP14NVNnativeImagePK21NVNnativeImageBuilder", ov_ni_init);
+HOST_OVERRIDE("_Z22nvnNativeImageFinalizeP14NVNnativeImage", ov_ni_fini);
+HOST_OVERRIDE("_Z35nvnTextureInitializeFromNativeImageP10NVNtextureP14NVNnativeImage", ov_tex_from_ni);

@@ -173,7 +173,8 @@ static void ov_display_max_res(Cpu *c) {
     int32_t *out = arg_p(c, 0);
     unsigned wh[2] = {1920, 1080};
     res_display_size(wh);
-    if (out) *out = wh[1] >= 2160 ? 3 : wh[1] >= 1440 ? 2 : wh[1] >= 1080 ? 1 : 0;
+    int32_t v = wh[1] >= 2160 ? 3 : wh[1] >= 1440 ? 2 : wh[1] >= 1080 ? 1 : 0;
+    if (out) *out = v;
     ret_x(c, 0);
 }
 static void ov_vi_void(Cpu *c) { (void)c; }

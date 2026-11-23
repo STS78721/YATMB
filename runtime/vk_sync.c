@@ -474,6 +474,9 @@ uint64_t vk_sync_submit_record(VkSyncRecordFn record, void *context, uint64_t su
     plat_mutex_lock(&sub_lock);
     vk_mem_dirty_submit();   // TOTK_TRACE=perf: what a mirror would upload before this submit
     uint64_t fence = __atomic_load_n(&issued, __ATOMIC_ACQUIRE) + 1;
+    plat_mutex_lock(&st_lock);
+    if (reserved < fence) reserved = fence;
+    plat_mutex_unlock(&st_lock);
     cur_fence = fence;
     // A texture alias can retire an image or view used earlier in this recording. Collection must wait for this
     // submission, including every split part, before the first command can reference those objects.

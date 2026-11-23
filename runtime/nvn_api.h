@@ -59,6 +59,14 @@ int nvn_window_origin_upper(void);                         // 1 after SetWindowO
 int nvn_viewport_y_negate(void);                           // 1 when viewport 0 swizzle Y is NEGATIVE_Y
 void nvn_set_viewport_y_negate(int v);                     // SetViewportSwizzles updates viewport 0
 void nvn_guest_written(uint64_t addr, uint64_t size);      // the host or the game wrote pool storage: back end re-reads
+NVNdevice *nvn_default_device(void);                       // most recently initialized NVNdevice (for NVX compatibility procs)
+int nvn_pool_init_host(pool_t *o, void *mem, uint64_t size, uint32_t flags);
+void nvn_pool_fini_host(pool_t *o);
+int nvn_tex_init_host(tex_t *o, const tex_builder_t *s);
+int codec_native_image_query(uint32_t handle, uint32_t *w, uint32_t *h, uint8_t **guest_buf, size_t *guest_size);
+void codec_native_image_attach(uint32_t handle, uint8_t *mem, size_t size, uint32_t w, uint32_t h, uint32_t stride,
+                               int format);
+void codec_native_image_detach(uint32_t handle, const uint8_t *mem);
 // TOTK_TRACE=perf: MemoryPoolFlushMappedRange [0] and BufferFlushMappedRange [1] calls [0] and bytes [1] by the pool's
 // CPU class (0 CPU_CACHED, 1 CPU_UNCACHED, 2 other) since the previous call.
 void nvn_flush_stats(uint64_t out[2][3][2]);
@@ -99,6 +107,7 @@ typedef struct { int32_t bits, pad; } p_barrier;           // OP_BARRIER: NVNbar
 // OP_WAIT_SYNC retains the source until submit preparation, as the SDK's control record does. The caller keeps
 // the sync alive through each submit; the backend never dereferences it after preparation returns.
 typedef struct { const sync_t *sync; } p_wait_sync;
+typedef struct { sync_t *sync; } p_fence_sync;
 typedef struct { uint64_t target; } p_jump;                // OP_JUMP / OP_CALL: next record / called recording
 // OP_DRAW_IDX_IND: DrawElementsIndirect; ind = GPU address of {count, instances, first index, base vertex, base
 // instance} (VkDrawIndexedIndirectCommand's layout), read by the GPU when the draw runs
@@ -125,6 +134,7 @@ int nvn_handle_live(uint64_t handle);                      // 1 while the handle
                                                            // not added again)
 uint64_t nvn_handle_bytes(uint64_t handle);                // bytes of the copy, OP_BEGIN to OP_END; 0 if not live
 uint64_t nvn_submit_count(void);                           // QueueSubmitCommands calls so far
+void nvn_submit_fence_syncs(const uint64_t *handles, int n, uint64_t fence);
 const char *nvn_op_name(uint32_t op);                      // "DRAW_IDX", ...; "?" past OP_COUNT_
 // MemoryPoolInvalidateMappedRange: the CPU is about to read pool storage the GPU wrote. Weak no-op in nvn_ext.c; a back
 // end that renders into host-side copies defines it and writes them back.

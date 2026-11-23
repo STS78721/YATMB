@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "cfg.h"
+#include "game_profile.h"
 #include "host.h"
 #include "platform/platform.h"
 #include "vk.h"
@@ -319,7 +320,8 @@ static void isa_dump(VkPipeline p, uint64_t vs, uint64_t gs, uint64_t fs) {
                     if (!ir[j].pData) continue;
                     char path[PLAT_PATH_MAX * 3 + 96], suffix[24] = "";
                     if (i || j) snprintf(suffix, sizeof suffix, "-%u-%u", i, j);
-                    if (cut) snprintf(path, sizeof path, "%.*s/dkb-isa-%llx-%s%s.%s", (int)(cut - lp), lp, (unsigned long long)(uintptr_t)p, stage,
+                    if (cut) snprintf(path, sizeof path, "%.*s/%s-isa-%llx-%s%s.%s", (int)(cut - lp), lp,
+                                      game_profile()->short_name, (unsigned long long)(uintptr_t)p, stage,
                                       suffix, ir[j].isText ? "txt" : "bin");
                     if (cut && plat_file_write_atomic(path, ir[j].pData, ir[j].dataSize)) {
                         rt_log("vk: pipeline %p executable %u representation \"%s\" saved: %s (%zu bytes)", (void *)p, i, ir[j].name, path, ir[j].dataSize);

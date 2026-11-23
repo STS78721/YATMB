@@ -258,9 +258,10 @@ static class SwshXlate
             // EarlyZForce); the SPIR-V then declares EarlyFragmentTests (MacNativeGames ae8f4f4).
             bool earlyZ = _job["early_fragment_tests"] is JsonValue ez && ez.TryGetValue<bool>(out bool eb) && eb;
             return new GpuGraphicsState(earlyZ, GeometryInput, false, TessPatchType.Triangles, TessSpacing.EqualSpacing,
-                false, false, false, depthMinusW, false, 1f, AlphaTestOp.Always, 0f, attr, false, fout, false,
+                false, false, false, depthMinusW, false, 1f, AlphaTestOp.Always, 0f, attr, true, fout, false,
                 false /* 不做 Y 取反 | no Y flip */, true /* 原点左上 | origin upper-left */, false);
         }
+        public bool QueryHasConstantBufferDrawParameters() => true;
         public bool QueryHostSupportsDepthClipControl() => true;
         public bool QueryHostSupportsGeometryShaderPassthrough() => false;
         // Vulkan: the ConstOffset / ConstOffsets image operands Ryujinx emits must be constants. A TLD4.PTP whose offsets

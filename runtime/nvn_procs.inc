@@ -535,6 +535,7 @@ NVN_PROC(nvnWindowSetNumActiveTextures)
 NVN_PROC(nvnWindowSetPresentInterval)
 NVN_PROC(nvnSyncGetNvRmSyncNVX)
 NVN_PROC(nvnSyncInitializeFromNvRmSyncNVX)
+NVN_PROC(nvnTextureGetDeviceNVX)
 NVN_PROC(nvnTextureGetNvRmSurfaceNVX)
 // The NVN 2 names Donkey Kong Bananza asks for beyond these.
 #include "nvn_procs_nvn2.inc"

@@ -91,6 +91,16 @@ WEAK void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     rt_fatal("vk: op %s is not replayed yet", nvn_op_name(op));
 }
 
+WEAK int vk_exec_ubo_handle_res(const GfxShaderRes *r) {
+    (void)r;
+    return 0;
+}
+
+WEAK uint64_t vk_exec_ubo_handle(const VkExec *ex, int st, const GfxShaderRes *r) {
+    (void)ex, (void)st, (void)r;
+    return 0;
+}
+
 WEAK void vk_exec_op_xfer(VkExec *ex, uint32_t op, const void *payload) {
     (void)ex, (void)payload;
     rt_fatal("vk: op %s is not replayed yet", nvn_op_name(op));
@@ -570,7 +580,51 @@ static void barrier_to(VkExec *ex, const VkImage *want, const VkImageAspectFlags
     ex->barrier_at = ++ex->recorded;
 }
 
-void vk_exec_barrier(VkExec *ex) { barrier_to(ex, NULL, NULL, 0); }
+extern void vk_exec_draw_flush(uint64_t fence, int done);
+
+// Deferred whole-target clears outside a pass, coalesced into VK_ATTACHMENT_LOAD_OP_CLEAR when the next pass
+// begins (eliminates redundant standalone transfer clears + full barriers and allows hardware fast-clear / HiZ).
+static struct {
+    uint32_t mask;   // bit 0..7: color[i], bit 8: depth, bit 9: stencil
+    VkClearColorValue color[8];
+    float depth;
+    uint32_t stencil;
+} pend_clear;
+
+static void flush_pending_clears(VkExec *ex) {
+    uint32_t m = pend_clear.mask;
+    if (!m) return;
+    pend_clear.mask = 0;
+    resolve_rt(ex);
+    barrier_to(ex, NULL, NULL, 0);
+    for (uint32_t i = 0; i < 8; i++) {
+        if (!(m & (1u << i))) continue;
+        const VkExecTarget *t = &ex->color[i];
+        if (!t->image) continue;
+        VkImageSubresourceRange r = {VK_IMAGE_ASPECT_COLOR_BIT, t->level, 1, t->base_layer, t->layers};
+        vkCmdClearColorImage(ex->cb, t->image, VK_IMAGE_LAYOUT_GENERAL, &pend_clear.color[i], 1, &r);
+        ex->recorded++;
+        vk_texture_gpu_written(t->tex);
+    }
+    if (m & 0x300u) {
+        const VkExecTarget *t = &ex->depth;
+        VkImageAspectFlags asp = 0;
+        if ((m & 0x100u) && (t->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) asp |= VK_IMAGE_ASPECT_DEPTH_BIT;
+        if ((m & 0x200u) && (t->aspect & VK_IMAGE_ASPECT_STENCIL_BIT)) asp |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        if (t->image && asp) {
+            VkClearDepthStencilValue v = {pend_clear.depth, pend_clear.stencil};
+            VkImageSubresourceRange r = {asp, t->level, 1, t->base_layer, t->layers};
+            vkCmdClearDepthStencilImage(ex->cb, t->image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
+            ex->recorded++;
+            vk_texture_gpu_written(t->tex);
+        }
+    }
+}
+
+void vk_exec_barrier(VkExec *ex) {
+    flush_pending_clears(ex);
+    barrier_to(ex, NULL, NULL, 0);
+}
 
 static uint64_t depth_layer_mask(uint32_t base_layer, uint32_t layers) {
     if (base_layer >= 64 || !layers) return 0;
@@ -614,6 +668,8 @@ static int mtf_unowned_shadow_needs_clear(const VkExec *ex, const VkExecTarget *
 void vk_exec_pass_begin(VkExec *ex) {
     if (ex->in_pass) return;
     resolve_rt(ex);
+    uint32_t pcm = pend_clear.mask;
+    pend_clear.mask = 0;
     // A private depth-only target the game never clears (MTF sun maps 7168 and 1024) still holds 0 from an
     // older init, or last frame's depths. LESS writes then fail against 0, and the GREATER sample of that
     // empty map leaves the court without silhouettes. Clear to the far of the depth range at most once per
@@ -657,7 +713,7 @@ void vk_exec_pass_begin(VkExec *ex) {
     }
     barrier_to(ex, want, wasp, nwant);   // passes, clears, copies and dispatches see each other's results
     ex->fbl_mask = fbl;
-    ex->fb_dirty = 0;
+    ex->fb_dirty = (pcm & 0xffu) | ((pcm & 0x300u) ? 0x100u : 0u);
     ex->pass_serial++;
     VkRenderingAttachmentInfo ca[8], da = {0}, sa = {0};
     for (uint32_t i = 0; i < ex->pass_ncolor; i++) {
@@ -666,16 +722,28 @@ void vk_exec_pass_begin(VkExec *ex) {
         if (!t->image) continue;
         ca[i].imageView = view_of(ex, t);
         ca[i].imageLayout = fbl >> i & 1 ? VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT : VK_IMAGE_LAYOUT_GENERAL;
-        ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;    }
+        if (pcm & (1u << i)) {
+            ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            ca[i].clearValue.color = pend_clear.color[i];
+        } else {
+            ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        }
+        ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    }
     const VkExecTarget *d = &ex->depth;
     if (d->image) {
         VkRenderingAttachmentInfo a = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = view_of(ex, d),
                                        .imageLayout = fbl >> 8 & 1 ? VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT
                                                                    : VK_IMAGE_LAYOUT_GENERAL,
                                        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
-        if (d->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) da = a;
-        if (d->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) sa = a;
+        if (d->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) {
+            da = a;
+            if (pcm & 0x100u) da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, da.clearValue.depthStencil.depth = pend_clear.depth;
+        }
+        if (d->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) {
+            sa = a;
+            if (pcm & 0x200u) sa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, sa.clearValue.depthStencil.stencil = pend_clear.stencil;
+        }
     }
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {ex->pass_w, ex->pass_h}},
                           .layerCount = ex->pass_layers, .colorAttachmentCount = ex->pass_ncolor,
@@ -814,6 +882,16 @@ static void clear_color(VkExec *ex, const p_clear_color *c) {
     VkClearColorValue cv;
     memcpy(cv.float32, c->rgba, sizeof cv.float32);   // integer targets: the payload's bits as the front end stored them
     if (whole_target(ex, t)) {
+        if (t->layers == ex->pass_layers) {
+            for (int j = 0; j < 8; j++)
+                if (j != i && (pend_clear.mask & (1u << j)) && ex->color[j].image == t->image) {
+                    flush_pending_clears(ex);
+                    break;
+                }
+            pend_clear.color[i] = cv;
+            pend_clear.mask |= 1u << i;
+            return;
+        }
         vk_exec_barrier(ex);
         VkImageSubresourceRange r = {VK_IMAGE_ASPECT_COLOR_BIT, t->level, 1, t->base_layer, t->layers};
         vkCmdClearColorImage(ex->cb, t->image, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &r);
@@ -867,6 +945,11 @@ static void clear_ds(VkExec *ex, const p_clear_ds *c) {
     if (asp & VK_IMAGE_ASPECT_DEPTH_BIT) vk_exec_mark_depth_cleared(t->img, t->base_layer, t->layers);
     VkClearDepthStencilValue v = {d, (uint32_t)c->stencil & 0xff};
     if (whole_target(ex, t)) {
+        if (t->layers == ex->pass_layers) {
+            if (asp & VK_IMAGE_ASPECT_DEPTH_BIT) pend_clear.depth = v.depth, pend_clear.mask |= 0x100u;
+            if (asp & VK_IMAGE_ASPECT_STENCIL_BIT) pend_clear.stencil = v.stencil, pend_clear.mask |= 0x200u;
+            return;
+        }
         vk_exec_barrier(ex);
         VkImageSubresourceRange r = {asp, t->level, 1, t->base_layer, t->layers};
         vkCmdClearDepthStencilImage(ex->cb, t->image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
@@ -883,6 +966,7 @@ static void clear_ds(VkExec *ex, const p_clear_ds *c) {
 
 static void set_rt(VkExec *ex, const p_set_rt *r) {
     if (!memcmp(&ex->rt, r, sizeof *r)) return;   // the same targets again: the pass goes on
+    flush_pending_clears(ex);
     vk_exec_pass_end(ex);
     ex->rt = *r;
     ex->rt_resolved = 0;
@@ -914,10 +998,11 @@ static void maybe_split(VkExec *ex) {
         rt_log("vk: replay command buffer split every %d draws between passes, parts of at least %d us%s", split_n,
                us > 0 ? us : 0, split_n ? "" : " (off)");
     }
-    if (!split_n || ex->in_pass || split_draws < split_n) return;
+    if (!split_n || ex->in_pass || pend_clear.mask || split_draws < split_n) return;
     if (split_ns && kern_now_ns() - part_t0 < split_ns) return;   // split_draws stays: the next draw asks again
     split_draws = 0;
     if (ex->recorded == part_start) return;
+    vk_exec_draw_flush(ex->fence, 0);
     ex->cb = vk_sync_split();
     part_start = ex->recorded;
     part_t0 = kern_now_ns();
@@ -959,6 +1044,7 @@ int vk_exec_read_buffer(VkExec *ex, uint64_t addr, uint64_t size, void *out) {
     ex->recorded += 2;
     vk_mem_count(source.cls, VK_MUSE_COPY_SRC, size);
     VK_MEM_BOUND(source);
+    vk_exec_draw_flush(ex->fence, 0);
     ex->cb = vk_sync_split_wait();   // this prefix, not ex->fence (only the final part signals that value)
     split_draws = 0;
     part_start = ex->recorded;
@@ -1037,6 +1123,7 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         case OP_SET_SAMP_POOL: ex->samp_pool = ((const p_set_pool *)a)->pool, ex->tex_serial++; break;
         case OP_BARRIER: vk_exec_barrier(ex); break;
         case OP_WAIT_SYNC: break;   // submit preparation waited before any replay/snapshot; source may be gone
+        case OP_FENCE_SYNC: break;   // fenced on submit in nvn_api_core.c
         case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: case OP_UPDATE_UB: case OP_DRAW_IDX_IND: case OP_DRAW_IDX_IND_COUNT:
         case OP_DISPATCH_IND: {
             int is_draw = h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND || h->op == OP_DRAW_IDX_IND_COUNT;
@@ -1081,6 +1168,7 @@ static int record_impl(VkCommandBuffer cb, const uint64_t *handles, int n, uint6
     ex->nviews = 0;
     ex->barrier_at = -1;
     ex->nfbl = 0;   // the previous command buffer ended with a full barrier: every image is in GENERAL
+    pend_clear.mask = 0;
     vk_exec_frame.submits++;
     split_draws = part_start = 0;
     part_t0 = kern_now_ns();
@@ -1094,10 +1182,12 @@ static int record_impl(VkCommandBuffer cb, const uint64_t *handles, int n, uint6
             walk(ex, nvn_op_first(handles[i]), 0);
         }
     }
+    flush_pending_clears(ex);
     vk_exec_pass_end(ex);
     x_here = 0;
     if (ex->recorded) vk_exec_barrier(ex);   // later submissions see this one's writes
     if (memory) ex->recorded += vk_mem_mirror_end(ex->cb, fence), vk_usnap_end(fence);   // VRAM mirror bytes the GPU wrote go back to guest memory
+    vk_exec_draw_flush(fence, 1);
     if (ex->nviews) {
         ViewList *l = malloc(sizeof *l + sizeof(VkImageView) * (size_t)ex->nviews);
         if (!l) rt_fatal("vk: out of memory");

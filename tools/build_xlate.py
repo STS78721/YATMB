@@ -103,8 +103,8 @@ def verify_vendor() -> None:
 
 def selected_patches(*, defined_float_minmax: bool = False) -> list[Path]:
     patches = sorted((XLATE / "patches").glob("*.patch"))
-    if len(patches) != 27:
-        sys.exit(f"expected 27 patches, found {len(patches)}")
+    if len(patches) != 29:
+        sys.exit(f"expected 29 patches, found {len(patches)}")
     optional = XLATE / "patches" / DEFINED_FLOAT_MINMAX_PATCH
     if optional not in patches:
         sys.exit(f"missing optional patch: {DEFINED_FLOAT_MINMAX_PATCH}")
@@ -202,6 +202,10 @@ def main() -> None:
     if mkw_exe != exe:
         shutil.copy2(exe, mkw_exe)
         write_identity(mkw_exe, defined_float_minmax=a.defined_float_minmax)
+    ns2_exe = BUILD / ("ns2_xlate.exe" if WIN else "ns2_xlate")
+    if ns2_exe != exe:
+        shutil.copy2(exe, ns2_exe)
+        write_identity(ns2_exe, defined_float_minmax=a.defined_float_minmax)
     print(f"built {exe} ({exe.stat().st_size / 1e6:.1f} MB) in {time.time() - started:.0f} s")
 
 

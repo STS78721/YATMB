@@ -23,6 +23,7 @@
 
 #include "cfg.h"
 #include "fs.h"
+#include "game_profile.h"
 #include "host.h"
 #include "romfs_config.h"
 #include "romfs_path.h"
@@ -461,7 +462,7 @@ static void load_index(void) {
     else strcpy(index_dir, ".");
     uint64_t sz = 0;
     index_bytes = plat_file_read(path, &sz);
-    if (!index_bytes) rt_fatal("RomFS index %s missing (tools/build_game.py writes it next to totk.exe)", path);
+    if (!index_bytes) rt_fatal("RomFS index %s missing (tools/build_game.py writes it next to %s.exe)", path, game_profile()->short_name);
     need(sz >= 24 && sz < (128 << 20), "index size");
     index_size = (size_t)sz;
     uint8_t d[32];
@@ -500,8 +501,8 @@ static void init_once(void *param) {
     const char *dir = rt_config()->romfs;
     need(snprintf(image_file, sizeof image_file, "%s/romfs.bin", dir) < (int)sizeof image_file, "image path");
     image = open_read(image_file);
-    if (!image) rt_fatal("RomFS image %s missing; put romfs.bin into the romfs folder next to totk or set TOTK_ROMFS",
-                         image_file);
+    if (!image) rt_fatal("RomFS image %s missing; put romfs.bin into the romfs folder next to %s.exe or set NS2_ROMFS",
+                         image_file, game_profile()->short_name);
     PlatFileId sz;
     need(plat_file_id(image, &sz), "image size");
     if (sz.size != ROMFS_IMAGE_SIZE)
@@ -696,10 +697,23 @@ void romfs_close(uint64_t h) {
 }
 
 uint32_t romfs_entry_type(int *out, const char *path) {
-    if (!out) return FS_R_INVALID;
+    if (!out || !path) return FS_R_INVALID;
+    // a directory may be named with its trailing separator ("rom:/Game/"), which nn::fs accepts; the root ("rom:/")
+    // is a directory
+    char trimmed[4096];
+    size_t len = strlen(path);
+    if (len >= sizeof trimmed) return FS_R_PATH_NOT_FOUND;
+    memcpy(trimmed, path, len + 1);
+    size_t mlen = 0;
+    const char *mname = romfs_find_mount(trimmed, &mlen);
+    if (!mname) return FS_R_PATH_NOT_FOUND;
+    while (len > mlen + 2 && trimmed[len - 1] == '/') trimmed[--len] = 0;
+    if (len == mlen + 2 && trimmed[mlen] == ':' && trimmed[mlen + 1] == '/') {
+        *out = FS_ENTRY_DIRECTORY;
+        return 0;
+    }
     char norm[4096];
-    const char *mname = romfs_find_mount(path, NULL);
-    const char *p = mname ? romfs_path_norm(mname, path, norm, sizeof norm) : NULL;
+    const char *p = romfs_path_norm(mname, trimmed, norm, sizeof norm);
     if (!p) return FS_R_PATH_NOT_FOUND;
     if (file_index(p) != UINT64_MAX) {
         *out = FS_ENTRY_FILE;

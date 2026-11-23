@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "game_profile.h"
 #include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
@@ -335,18 +336,26 @@ NVN_API(nvnDlssNetworkBuilderSetOutputResolution) {
     dlss_builder_t *b = dlss_builder_of(arg_p(c, 0), 0);
     uint32_t in_w = (uint32_t)arg_x(c, 1);
     uint32_t in_h = (uint32_t)arg_x(c, 2);
-    uint32_t cw = 0, ch = 0;
-    ff_get_target_resolutions(&cw, &ch, NULL, NULL);
+    const RtGameProfile *gp = game_profile();
+    int use_ff = (gp && gp->short_name && !strcmp(gp->short_name, "ff"));
+    uint32_t cw = in_w, ch = in_h;
+    if (use_ff) {
+        uint32_t tw = 0, th = 0;
+        ff_get_target_resolutions(&tw, &th, NULL, NULL);
+        if (tw > 0 && th > 0) cw = tw, ch = th;
+    }
     if (b) {
-        b->out_w = (cw > 0) ? cw : in_w;
-        b->out_h = (ch > 0) ? ch : in_h;
+        b->out_w = cw;
+        b->out_h = ch;
     }
     rt_log("dlss: SetOutputResolution %ux%u -> %ux%u (lr=%#llx)", in_w, in_h, b ? b->out_w : 0, b ? b->out_h : 0, (unsigned long long)c->x[30]);
 }
 NVN_API(nvnDlssNetworkBuilderGetOutputResolution) {
     dlss_builder_t *b = dlss_builder_of(arg_p(c, 0), 0);
-    uint32_t cw = 0, ch = 0;
-    ff_get_target_resolutions(&cw, &ch, NULL, NULL);
+    const RtGameProfile *gp = game_profile();
+    int use_ff = (gp && gp->short_name && !strcmp(gp->short_name, "ff"));
+    uint32_t cw = 1920u, ch = 1080u;
+    if (use_ff) ff_get_target_resolutions(&cw, &ch, NULL, NULL);
     uint32_t w = (b && b->out_w) ? b->out_w : cw;
     uint32_t h = (b && b->out_h) ? b->out_h : ch;
     dlss_write_u32(c, 1, w);
@@ -358,10 +367,16 @@ NVN_API(nvnDlssNetworkBuilderSetPreset) { dlss_builder_t *b = dlss_builder_of(ar
 NVN_API(nvnDlssNetworkBuilderGetPreset) { dlss_builder_t *b = dlss_builder_of(arg_p(c, 0), 0); ret_x(c, b ? b->preset : 0); }
 NVN_API(nvnDlssNetworkBuilderGetOptimalSettings) {
     dlss_builder_t *b = dlss_builder_of(arg_p(c, 0), 0);
-    uint32_t cw = 0, ch = 0, sw = 0, sh = 0;
-    ff_get_target_resolutions(&cw, &ch, &sw, &sh);
-    uint32_t w = (sw > 0) ? sw : ((b && b->out_w) ? b->out_w : 1920u);
-    uint32_t h = (sh > 0) ? sh : ((b && b->out_h) ? b->out_h : 1080u);
+    const RtGameProfile *gp = game_profile();
+    int use_ff = (gp && gp->short_name && !strcmp(gp->short_name, "ff"));
+    uint32_t cw = (b && b->out_w) ? b->out_w : 1920u;
+    uint32_t ch = (b && b->out_h) ? b->out_h : 1080u;
+    uint32_t w = cw, h = ch;
+    if (use_ff) {
+        uint32_t sw = 0, sh = 0;
+        ff_get_target_resolutions(&cw, &ch, &sw, &sh);
+        if (sw > 0 && sh > 0) w = sw, h = sh;
+    }
     rt_log("dlss: GetOptimalSettings out=%ux%u optimal_scene=%ux%u method=%u preset=%u (lr=%#llx)",
            b ? b->out_w : cw, b ? b->out_h : ch, w, h, b ? b->method : 0, b ? b->preset : 0, (unsigned long long)c->x[30]);
     dlss_write_u32(c, 1, w);

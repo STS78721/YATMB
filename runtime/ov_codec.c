@@ -22,13 +22,17 @@
 #include <vpx/vpx_decoder.h>
 #include <dav1d/dav1d.h>
 
+#include "h264.h"
 #include "host.h"
+#include "nvn_api.h"
 #include "platform/platform.h"
 
 enum { R_NOT_READY = 0x1c266f };   // (result & 0x3fffff) - 0x1c2000 == 0x66f: "try again" for the game's wrapper
 // QUEUED: packets the decoder takes ahead of the buffers for their pictures, as Eglantine's video session does
 // (nx2_gsv.h, INx2VideoSession::MaxQueuedInputs); a submission past them answers "not ready".
-enum { SLOTS = 16, DECODERS = 4, WAITERS = 4, QUEUED = 8 };
+// PICS: H.264 pictures the decoder gave out ahead of a buffer reserved for them (a drain at the end gives its whole
+// reorder delay at once).
+enum { SLOTS = 16, DECODERS = 4, WAITERS = 4, QUEUED = 8, PICS = 64 };
 enum { S_FREE, S_WAIT, S_FILLED };   // registered; acquired with no picture yet; acquired holding a picture
 enum { FENCE_TAG = 0xc0de0000u };    // fence token: tag | decoder << 8 | buffer
 
@@ -64,6 +68,10 @@ typedef struct {
     int vpx_ok;
     int av1;           // 1: AV1 through dav1d (Switch 2 movies); 0: VP9 through libvpx
     Dav1dContext *dav;
+    H264Dec *h264;     // H.264 (h264.h); its pictures wait in pics until a buffer is reserved for them
+    int is_h264;
+    H264Pic pics[PICS];
+    int npics, pics_end;   // pics_end: the last picture in pics ends the stream
     uint32_t seq;
     Slot slot[SLOTS];
     Slot last;         // the newest picture, for packets that show none
@@ -74,6 +82,22 @@ typedef struct {
 static Dec decs[DECODERS];
 static PlatMutex lock = PLAT_MUTEX_INIT;   // every decoder call; held across a decode (one 960x540 frame, a few ms)
 
+enum { NI_MAX = 64 };
+typedef struct {
+    uint32_t handle, image_idx;
+    uint64_t pool;
+    uint32_t pref_w, pref_h;
+    uint8_t *guest_buf;
+    size_t guest_size;
+    uint8_t *tex_mem;
+    size_t tex_size;
+    uint32_t tex_w, tex_h, tex_stride;
+    int tex_format, attached;
+} NiEntry;
+typedef struct { uint64_t addr, size; } NiDirty;
+static NiEntry ni_tab[NI_MAX];
+static uint32_t ni_next_id;
+
 static Dec *dec_of(uint64_t key) {
     for (int i = 0; i < DECODERS; i++)
         if (decs[i].key == key) return &decs[i];
@@ -82,6 +106,214 @@ static Dec *dec_of(uint64_t key) {
 
 static uint32_t cw(uint16_t w) { return (w + 1u) / 2; }
 static uint32_t ch(uint16_t h) { return (h + 1u) / 2; }
+
+static inline uint8_t clamp_u8(int v) { return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
+
+static int is_bgra_format(int format) {
+    return format == NVN_FORMAT_BGRA8 || format == NVN_FORMAT_BGRA8_SRGB ||
+           format == NVN_FORMAT_BGRX8 || format == NVN_FORMAT_BGRX8_SRGB;
+}
+
+// ITU-R BT.709 limited-range NV12 -> RGBA8/BGRA8 conversion into a linear pitch destination buffer.
+static void nv12_to_rgba_rect(const uint8_t *nv12, uint32_t sw, uint32_t sh, uint32_t sx0, uint32_t sy0,
+                              uint32_t rw, uint32_t rh, uint8_t *dst, uint32_t dw, uint32_t dh, size_t dst_stride,
+                              size_t dst_limit, int format) {
+    if (!nv12 || !dst || !sw || !sh || !dw || !dh || dst_stride < 4) return;
+    int bgra = is_bgra_format(format);
+    uint32_t uv_stride = 2u * cw((uint16_t)sw);
+    const uint8_t *uv_plane = nv12 + (size_t)sw * sh;
+    uint32_t cx = sx0 < sw ? sx0 : sw, cy = sy0 < sh ? sy0 : sh;
+    uint32_t copy_w = rw < sw - cx ? rw : sw - cx;
+    if (copy_w > dw) copy_w = dw;
+    if (copy_w > dst_stride / 4u) copy_w = (uint32_t)(dst_stride / 4u);
+    uint32_t copy_h = rh < sh - cy ? rh : sh - cy;
+    if (copy_h > dh) copy_h = dh;
+
+    for (uint32_t y = 0; y < copy_h; y++) {
+        size_t row_off = (size_t)y * dst_stride;
+        if (row_off >= dst_limit) break;
+        uint32_t max_px = (uint32_t)((dst_limit - row_off) / 4u);
+        uint32_t row_w = copy_w < max_px ? copy_w : max_px;
+        const uint8_t *yp = nv12 + (size_t)(cy + y) * sw + cx;
+        const uint8_t *uvp = uv_plane + (size_t)((cy + y) >> 1) * uv_stride;
+        uint8_t *dp = dst + row_off;
+        uint32_t x = 0;
+        if (((cx + x) & 1u) == 0) {
+            for (; x + 1 < row_w; x += 2) {
+                uint32_t uvx = (cx + x) & ~1u;
+                int d = (int)uvp[uvx] - 128;
+                int e = (int)uvp[uvx + 1] - 128;
+                int rv = 117489 * e + 32768;
+                int guv = -13975 * d - 34925 * e + 32768;
+                int bu = 138438 * d + 32768;
+                for (int p = 0; p < 2; p++) {
+                    int cy0 = 76309 * ((int)yp[x + (uint32_t)p] - 16);
+                    uint8_t r = clamp_u8((cy0 + rv) >> 16);
+                    uint8_t g = clamp_u8((cy0 + guv) >> 16);
+                    uint8_t b = clamp_u8((cy0 + bu) >> 16);
+                    uint8_t *out = dp + (size_t)(x + (uint32_t)p) * 4u;
+                    out[0] = bgra ? b : r;
+                    out[1] = g;
+                    out[2] = bgra ? r : b;
+                    out[3] = 255;
+                }
+            }
+        }
+        for (; x < row_w; x++) {
+            uint32_t uvx = (cx + x) & ~1u;
+            int cy0 = 76309 * ((int)yp[x] - 16);
+            int d = (int)uvp[uvx] - 128;
+            int e = (int)uvp[uvx + 1] - 128;
+            uint8_t r = clamp_u8((cy0 + 117489 * e + 32768) >> 16);
+            uint8_t g = clamp_u8((cy0 - 13975 * d - 34925 * e + 32768) >> 16);
+            uint8_t b = clamp_u8((cy0 + 138438 * d + 32768) >> 16);
+            uint8_t *out = dp + (size_t)x * 4u;
+            out[0] = bgra ? b : r;
+            out[1] = g;
+            out[2] = bgra ? r : b;
+            out[3] = 255;
+        }
+        if (row_w < dw && row_off + (size_t)dw * 4u <= dst_limit) {
+            for (uint32_t px = row_w; px < dw; px++) {
+                uint8_t *out = dp + (size_t)px * 4u;
+                out[0] = out[1] = out[2] = 0;
+                out[3] = 255;
+            }
+        }
+    }
+    for (uint32_t y = copy_h; y < dh; y++) {
+        size_t row_off = (size_t)y * dst_stride;
+        if (row_off >= dst_limit) break;
+        size_t bytes = (size_t)dw * 4u;
+        if (bytes > dst_limit - row_off) bytes = dst_limit - row_off;
+        for (size_t off = 0; off + 3 < bytes; off += 4) {
+            dst[row_off + off] = 0;
+            dst[row_off + off + 1] = 0;
+            dst[row_off + off + 2] = 0;
+            dst[row_off + off + 3] = 255;
+        }
+    }
+}
+
+static NiEntry *ni_alloc_locked(void) {
+    for (int i = 0; i < NI_MAX; i++)
+        if (!ni_tab[i].pool) return &ni_tab[i];
+    for (int i = 0; i < NI_MAX; i++)
+        if (!ni_tab[i].attached) {
+            memset(&ni_tab[i], 0, sizeof ni_tab[i]);
+            return &ni_tab[i];
+        }
+    return NULL;
+}
+
+static uint32_t ni_next_handle_locked(void) {
+    if (++ni_next_id > 0xffffu || !ni_next_id) ni_next_id = 1;
+    return 0x4e490000u + ni_next_id;
+}
+
+static const Slot *slot_for_pool_locked(uint64_t pool) {
+    if (!pool) return NULL;
+    for (int k = 0; k < DECODERS; k++)
+        for (int i = 0; decs[k].key && i < SLOTS; i++)
+            if (decs[k].slot[i].pool == pool && decs[k].slot[i].nv12) return &decs[k].slot[i];
+    return NULL;
+}
+
+static void ni_upload_slot_locked(const Slot *s, NiDirty *dirty, int *ndirty) {
+    if (!s || !s->pool || !s->nv12 || !dirty || !ndirty) return;
+    for (int i = 0; i < NI_MAX; i++) {
+        NiEntry *e = &ni_tab[i];
+        if (!e->attached || e->pool != s->pool || !e->tex_mem || !e->tex_size) continue;
+        mem_thaw((uintptr_t)e->tex_mem, e->tex_size);
+        nv12_to_rgba_rect(s->nv12, s->w, s->h, 0, 0, s->w, s->h, e->tex_mem, e->tex_w, e->tex_h, e->tex_stride,
+                          e->tex_size, e->tex_format);
+        if (*ndirty < SLOTS) dirty[(*ndirty)++] = (NiDirty){(uintptr_t)e->tex_mem, e->tex_size};
+    }
+}
+
+static void ni_notify_dirty(const NiDirty *dirty, int ndirty) {
+    for (int i = 0; i < ndirty; i++) nvn_guest_written(dirty[i].addr, dirty[i].size);
+}
+
+int codec_native_image_query(uint32_t handle, uint32_t *w, uint32_t *h, uint8_t **guest_buf, size_t *guest_size) {
+    if (!handle || !w || !h) return 0;
+    plat_mutex_lock(&lock);
+    const NiEntry *e = NULL;
+    for (int i = 0; i < NI_MAX; i++)
+        if (ni_tab[i].pool && ni_tab[i].handle == handle) { e = &ni_tab[i]; break; }
+    uint32_t out_w = 0, out_h = 0;
+    uint8_t *gb = NULL;
+    size_t gs = 0;
+    if (e) {
+        const Slot *s = slot_for_pool_locked(e->pool);
+        out_w = (s && s->w) ? s->w : e->pref_w;
+        out_h = (s && s->h) ? s->h : e->pref_h;
+        gb = e->guest_buf;
+        gs = e->guest_size;
+    }
+    plat_mutex_unlock(&lock);
+    *w = out_w;
+    *h = out_h;
+    if (guest_buf) *guest_buf = gb;
+    if (guest_size) *guest_size = gs;
+    return e && out_w && out_h;
+}
+
+void codec_native_image_attach(uint32_t handle, uint8_t *mem, size_t size, uint32_t w, uint32_t h, uint32_t stride,
+                               int format) {
+    if (!handle || !mem || !size) return;
+    int attached = 0;
+    plat_mutex_lock(&lock);
+    NiEntry *e = NULL;
+    for (int i = 0; i < NI_MAX; i++)
+        if (ni_tab[i].pool && ni_tab[i].handle == handle) { e = &ni_tab[i]; break; }
+    if (e) {
+        e->tex_mem = mem;
+        e->tex_size = size;
+        e->tex_w = w;
+        e->tex_h = h;
+        e->tex_stride = stride;
+        e->tex_format = format;
+        e->attached = 1;
+        attached = 1;
+        mem_thaw((uintptr_t)mem, size);
+        const Slot *s = slot_for_pool_locked(e->pool);
+        if (s && s->nv12) {
+            nv12_to_rgba_rect(s->nv12, s->w, s->h, 0, 0, s->w, s->h, mem, w, h, stride, size, format);
+        } else {
+            for (uint32_t y = 0; y < h; y++) {
+                size_t row = (size_t)y * stride;
+                if (row >= size) break;
+                size_t bytes = (size_t)w * 4u;
+                if (bytes > size - row) bytes = size - row;
+                for (size_t off = 0; off + 3 < bytes; off += 4) {
+                    mem[row + off] = 0;
+                    mem[row + off + 1] = 0;
+                    mem[row + off + 2] = 0;
+                    mem[row + off + 3] = 255;
+                }
+            }
+        }
+    }
+    plat_mutex_unlock(&lock);
+    if (attached) nvn_guest_written((uintptr_t)mem, size);
+}
+
+void codec_native_image_detach(uint32_t handle, const uint8_t *mem) {
+    if (!handle) return;
+    plat_mutex_lock(&lock);
+    for (int i = 0; i < NI_MAX; i++) {
+        NiEntry *e = &ni_tab[i];
+        if (e->handle == handle && (!mem || e->tex_mem == mem)) {
+            e->tex_mem = NULL;
+            e->tex_size = 0;
+            e->tex_w = e->tex_h = e->tex_stride = 0;
+            e->tex_format = 0;
+            e->attached = 0;
+        }
+    }
+    plat_mutex_unlock(&lock);
+}
 
 // Copies a decoded I420 picture into s as NV12.
 static void put_picture(Slot *s, const vpx_image_t *img) {
@@ -102,9 +334,15 @@ static void put_picture(Slot *s, const vpx_image_t *img) {
 }
 
 static void queue_drop(Dec *d);
+static void pics_drop(Dec *d) {
+    for (int i = 0; i < d->npics; i++) free(d->pics[i].nv12);
+    d->npics = d->pics_end = 0;
+}
 static void dec_free(Dec *d) {
     if (d->vpx_ok) vpx_codec_destroy(&d->vpx);
     if (d->dav) dav1d_close(&d->dav);
+    if (d->h264) h264_close(d->h264);
+    pics_drop(d);
     for (int i = 0; i < SLOTS; i++) free(d->slot[i].nv12);
     free(d->last.nv12);
     queue_drop(d);
@@ -169,7 +407,65 @@ static Slot *oldest_wait(Dec *d) {
 // Decodes one packet into the waiting buffer s (lock held). A packet that shows nothing leaves s waiting, except the
 // last one: the player then gets the previous picture (or black) marked as the end. Returns the number of events to
 // signal, stored in wake.
-static int decode_into(Dec *d, Slot *s, const uint8_t *data, size_t size, int64_t pts, int end, uint64_t wake[WAITERS]) {
+static int fill(Slot *s, int64_t pts, int end, uint64_t *wake, NiDirty *dirty, int *ndirty) {
+    s->state = S_FILLED, s->pts = pts, s->eos = end;
+    ni_upload_slot_locked(s, dirty, ndirty);
+    int n = 0;
+    for (int k = 0; k < WAITERS; k++)
+        if (s->waiter[k]) wake[n++] = s->waiter[k];
+    memset(s->waiter, 0, sizeof s->waiter);
+    return n;
+}
+
+// H.264 pictures waiting in d->pics go to the reserved buffers in acquisition order; wake has room for WAITERS events
+// per buffer. Returns the number of events stored.
+static int pics_out(Dec *d, uint64_t *wake, int room, NiDirty *dirty, int *ndirty) {
+    int n = 0;
+    Slot *s;
+    while (d->npics && room - n >= WAITERS && (s = oldest_wait(d))) {
+        H264Pic p = d->pics[0];
+        memmove(d->pics, d->pics + 1, (size_t)--d->npics * sizeof *d->pics);
+        free(s->nv12);
+        s->nv12 = p.nv12, s->w = p.w, s->h = p.h;
+        copy_slot(&d->last, s);
+        n += fill(s, p.pts, d->pics_end && !d->npics, wake + n, dirty, ndirty);
+        TRACE("H.264 picture pts %lld into buffer %d%s", (long long)p.pts, (int)(s - d->slot), s->eos ? " (end)" : "");
+    }
+    if (!d->npics) d->pics_end = 0;
+    return n;
+}
+
+// An H.264 packet: its pictures (none while the decoder fills its reorder delay; several at the end) go to waiting
+// buffers. An end that brings no picture at all ends on the previous one, or black, as decode_into does.
+static int decode_h264(Dec *d, Slot *s, const uint8_t *data, size_t size, int64_t pts, int end, uint64_t *wake,
+                       int room, NiDirty *dirty, int *ndirty) {
+    int got = 0;
+    if (d->h264) {
+        got = h264_decode(d->h264, data, size, pts, end, d->pics + d->npics, PICS - d->npics);
+        d->npics += got;
+        if (end && d->npics) d->pics_end = 1;
+    }
+    LOG_FIRST("codec: first H.264 packet: %zu bytes [%02x %02x %02x %02x %02x], %d pictures out", size,
+              size > 0 ? data[0] : 0, size > 1 ? data[1] : 0, size > 2 ? data[2] : 0, size > 3 ? data[3] : 0,
+              size > 4 ? data[4] : 0, got);
+    TRACE("H.264 packet %zu bytes pts %lld%s: %d pictures out, %d waiting", size, (long long)pts, end ? " end" : "",
+          got, d->npics);
+    int n = pics_out(d, wake, room, dirty, ndirty);
+    if (end && !d->npics && s && s->state == S_WAIT) {
+        if (d->last.nv12) copy_slot(s, &d->last);
+        else {
+            free(s->nv12);
+            s->w = s->h = 16;
+            if (!(s->nv12 = malloc(16 * 16 + 8 * 8 * 2))) rt_fatal("codec: out of memory");
+            memset(s->nv12, 16, 16 * 16), memset(s->nv12 + 16 * 16, 128, 8 * 8 * 2);
+        }
+        n += fill(s, pts, 1, wake + n, dirty, ndirty);
+    }
+    return n;
+}
+
+static int decode_into(Dec *d, Slot *s, const uint8_t *data, size_t size, int64_t pts, int end, uint64_t wake[WAITERS],
+                       NiDirty *dirty, int *ndirty) {
     const vpx_image_t *img = NULL, *f;
     Dav1dPicture pic = {0};
     int have_pic = 0;
@@ -221,14 +517,7 @@ static int decode_into(Dec *d, Slot *s, const uint8_t *data, size_t size, int64_
     TRACE("decode %zu bytes pts %lld%s: buffer %d %s", size, (long long)pts, end ? " end" : "", (int)(s - d->slot),
           filled ? "filled" : "still waiting (no picture shown)");
     LOG_FIRST("codec: first VP9 packet: %zu bytes, picture %ux%u", size, s->w, s->h);
-    int n = 0;
-    if (filled) {
-        s->state = S_FILLED, s->pts = pts, s->eos = end;
-        for (int k = 0; k < WAITERS; k++)
-            if (s->waiter[k]) wake[n++] = s->waiter[k];
-        memset(s->waiter, 0, sizeof s->waiter);
-    }
-    return n;
+    return filled ? fill(s, pts, end, wake, dirty, ndirty) : 0;
 }
 
 // Result nn::codec::video::Initialize(), Finalize(): nothing to open on the host
@@ -305,13 +594,52 @@ static void ov_make_image_preference(Cpu *c) {
 // The AV1 intro requests NV12.  RGBA variants are kept off the console IPC path; black is a safe fallback if another
 // movie selects one of them before a host conversion path is needed.
 static void ov_read_rgba(Cpu *c) {
+    uint64_t pool = arg_x(c, 0);
+    uint32_t x0 = arg_x(c, 2) & 0xffff, y0 = arg_x(c, 3) & 0xffff;
+    uint32_t w = arg_x(c, 4) & 0xffff, h = arg_x(c, 5) & 0xffff;
     uint8_t *out = arg_p(c, 6);
-    size_t size = arg_x(c, 8);
-    if (out && size <= 64u * 1024u * 1024u) memset(out, 0, size);
+    size_t pitch = arg_x(c, 7), size = arg_x(c, 8);
+    if (out && size) {
+        plat_mutex_lock(&lock);
+        const Slot *s = slot_for_pool_locked(pool);
+        if (s) nv12_to_rgba_rect(s->nv12, s->w, s->h, x0, y0, w, h, out, w, h, pitch, size, NVN_FORMAT_RGBA8);
+        else if (size <= 64u * 1024u * 1024u) memset(out, 0, size);
+        plat_mutex_unlock(&lock);
+    }
     ret_x(c, 0);
 }
 
-static void ov_h264_unsupported(Cpu *c) { ret_x(c, 0x1c0001u); }
+// Result InitializeH264Decoder*(..., u16 w, u16 h, ..., const void *config, size_t config_size): Media Foundation on
+// Windows (h264_win.c). Without a host decoder the result is the one the console's missing service gave (0x1c0001),
+// on which the SDK aborts.
+static void h264_init(Cpu *c, uint64_t key, unsigned w, unsigned h, const uint8_t *config, size_t config_size) {
+    if (config_size > (1u << 20)) config_size = 0;
+    H264Dec *x = h264_open(w, h, config, config_size);
+    if (!x) {
+        rt_log("codec: H.264 decoder %ux%u: no host decoder (%s)", w, h, h264_backend());
+        ret_x(c, 0x1c0001u);
+        return;
+    }
+    plat_mutex_lock(&lock);
+    Dec *d = dec_of(key);
+    if (!d) d = dec_of(0);
+    if (!d) rt_fatal("codec: more than %d video decoders", DECODERS);
+    dec_free(d);
+    d->key = key, d->is_h264 = 1, d->h264 = x;
+    plat_mutex_unlock(&lock);
+    rt_log("codec: H.264 decoder %#llx %ux%u on the host (%s), configuration %zu bytes%s", (unsigned long long)key, w, h,
+           h264_backend(), config_size, config && config_size && config[0] == 1 ? " (avcC)" : "");
+    ret_x(c, 0);
+}
+// (Type *, void *work, size_t, size_t, u16 w, u16 h, u32, in, out, [mode,] const void *, size_t)
+static void ov_h264_init(Cpu *c) { h264_init(c, arg_x(c, 0), arg_x(c, 4) & 0xffff, arg_x(c, 5) & 0xffff, arg_p(c, 9), arg_x(c, 10)); }
+static void ov_h264_init_tm(Cpu *c) { h264_init(c, arg_x(c, 0), arg_x(c, 4) & 0xffff, arg_x(c, 5) & 0xffff, arg_p(c, 10), arg_x(c, 11)); }
+// (Type *, size_t, size_t, u16 w, u16 h, u32, in, out, const void *, size_t)
+static void ov_h264_init_nowork(Cpu *c) { h264_init(c, arg_x(c, 0), arg_x(c, 3) & 0xffff, arg_x(c, 4) & 0xffff, arg_p(c, 8), arg_x(c, 9)); }
+// (Type *, size_t, u16 w, u16 h, u32, in, out, const void *, size_t)
+static void ov_h264_init_1sz(Cpu *c) { h264_init(c, arg_x(c, 0), arg_x(c, 2) & 0xffff, arg_x(c, 3) & 0xffff, arg_p(c, 7), arg_x(c, 8)); }
+// (Type *, size_t, u16 w, u16 h, u32, in, out, mode, const void *, size_t)
+static void ov_h264_init_rm(Cpu *c) { h264_init(c, arg_x(c, 0), arg_x(c, 2) & 0xffff, arg_x(c, 3) & 0xffff, arg_p(c, 8), arg_x(c, 9)); }
 
 // Result FinalizeVp9Decoder(Vp9DecoderType *)
 static void ov_vp9_fini(Cpu *c) {
@@ -322,14 +650,17 @@ static void ov_vp9_fini(Cpu *c) {
     ret_x(c, 0);
 }
 
-// Result FlushVp9Decoder(Vp9DecoderType *): outputs not handed over yet are dropped
+// Result FlushVp9Decoder(Vp9DecoderType *): outputs not handed over yet are dropped. H.264 Flush() drains
+// already-signalled (S_FILLED) buffers through TryWaitSyncPoint + Release/Acquire before pausing its event manager, so
+// leave S_FILLED H.264 slots signalled as hardware syncpoints do while still dropping queued packets and reorder frames.
 static void ov_vp9_flush(Cpu *c) {
     plat_mutex_lock(&lock);
     Dec *d = dec_of(arg_x(c, 0));
-    if (d)
+    if (d && !d->is_h264)
         for (int i = 0; i < SLOTS; i++)
             if (d->slot[i].state == S_FILLED) d->slot[i].state = S_WAIT;   // still reserved; its picture is dropped
     if (d) queue_drop(d);   // and so are the packets not decoded yet
+    if (d && d->is_h264) pics_drop(d), h264_flush(d->h264);
     plat_mutex_unlock(&lock);
     TRACE("flush");
     ret_x(c, 0);
@@ -350,20 +681,62 @@ static void ov_vp9_register(Cpu *c) {
 }
 
 // Result InitializeDecoderImagePool(pool, void *, size_t, const VideoDecoderImagePreference &, u32, CodecMode): the
-// size the player reads back at +0x20 / +0x22
+// size the player reads back at +0x20 / +0x22, plus the pool's native-image slot.
 static void ov_pool_init(Cpu *c) {
-    uint8_t *pool = arg_p(c, 0);
+    uint8_t *pool = arg_p(c, 0), *guest_buf = arg_p(c, 1);
+    size_t guest_size = arg_x(c, 2);
     const uint8_t *pref = arg_p(c, 3);
-    uint16_t w, h;
-    memcpy(&w, pref + 8, 2), memcpy(&h, pref + 10, 2);
+    uint16_t w = 0, h = 0;
+    if (pref) memcpy(&w, pref + 8, 2), memcpy(&h, pref + 10, 2);
     w++, h++;
-    memcpy(pool + 0x20, &w, 2), memcpy(pool + 0x22, &h, 2);
+    if (pool) memcpy(pool + 0x20, &w, 2), memcpy(pool + 0x22, &h, 2);
+    plat_mutex_lock(&lock);
+    uint64_t pk = (uintptr_t)pool;
+    for (int i = 0; i < NI_MAX; i++)
+        if (ni_tab[i].pool == pk) memset(&ni_tab[i], 0, sizeof ni_tab[i]);
+    NiEntry *e = ni_alloc_locked();
+    if (e && pk) {
+        e->handle = ni_next_handle_locked();
+        e->pool = pk;
+        e->image_idx = 0;
+        e->pref_w = w;
+        e->pref_h = h;
+        e->guest_buf = guest_buf;
+        e->guest_size = guest_size;
+    }
+    plat_mutex_unlock(&lock);
     ret_x(c, 0);
 }
 
-// Result CalculateDecoderImagePoolBuffer(size_t *size, size_t *align, const preference &, u32 count),
-// CalculateVp9DecoderWorkBuffer(size_t *size, size_t *align, size_t, u16 w, u16 h): the buffers hold nothing on the
-// host (the pictures are host memory), so one page each
+static void ov_pool_fini(Cpu *c) {
+    uint64_t pk = arg_x(c, 0);
+    plat_mutex_lock(&lock);
+    for (int i = 0; i < NI_MAX; i++)
+        if (ni_tab[i].pool == pk) memset(&ni_tab[i], 0, sizeof ni_tab[i]);
+    plat_mutex_unlock(&lock);
+    ret_x(c, 0);
+}
+
+static void ov_calc_pool_size(Cpu *c) {
+    uint64_t *sz_out = arg_p(c, 0), *al_out = arg_p(c, 1);
+    const uint8_t *pref = arg_p(c, 2);
+    uint32_t count = (uint32_t)arg_x(c, 3);
+    if (!count) count = 1;
+    uint16_t w = 0, h = 0;
+    if (pref) memcpy(&w, pref + 8, 2), memcpy(&h, pref + 10, 2);
+    w++, h++;
+    uint64_t total = 0x1000;
+    if (w && h && w <= 8192 && h <= 8192) {
+        uint64_t stride = ((uint64_t)w * 4u + 31u) & ~31ull;
+        uint64_t per = (stride * h + 0xfffu) & ~0xfffull;
+        total = per * count;
+    }
+    if (sz_out) *sz_out = total;
+    if (al_out) *al_out = 0x1000;
+    ret_x(c, 0);
+}
+
+// CalculateVp9DecoderWorkBuffer / CalculateH264DecoderWorkBuffer: work buffers hold nothing on the host, so one page.
 static void ov_calc_size(Cpu *c) {
     *(uint64_t *)arg_p(c, 0) = 0x1000;
     *(uint64_t *)arg_p(c, 1) = 0x1000;
@@ -458,11 +831,15 @@ static void ov_vp9_submit(Cpu *c) {
         ret_x(c, queued ? 0 : R_NOT_READY);
         return;
     }
-    uint64_t wake[WAITERS];
-    int n = decode_into(d, s, data, size, pts, end, wake);
+    uint64_t wake[SLOTS * WAITERS];
+    NiDirty dirty[SLOTS];
+    int ndirty = 0;
+    int n = d->is_h264 ? decode_h264(d, s, data, size, pts, end, wake, SLOTS * WAITERS, dirty, &ndirty)
+                       : decode_into(d, s, data, size, pts, end, wake, dirty, &ndirty);
     if (id) *id = d->seq;
     int can_accept = d && (oldest_wait(d) != NULL || d->qn < QUEUED);
     plat_mutex_unlock(&lock);
+    ni_notify_dirty(dirty, ndirty);
     for (int k = 0; k < n; k++) codec_signal_event(c, wake[k]);
     if (can_accept) codec_signal_event(c, event_for(c, key));
     ret_x(c, 0);
@@ -475,7 +852,8 @@ static void ov_vp9_acquire(Cpu *c) {
     uint32_t *index = arg_p(c, 0), *fence = arg_p(c, 1);
     uint64_t key = arg_x(c, 2);
     uint64_t wake[SLOTS * WAITERS];
-    int n = 0;
+    NiDirty dirty[SLOTS];
+    int n = 0, ndirty = 0;
     plat_mutex_lock(&lock);
     Dec *d = dec_of(key);
     int got = -1;
@@ -488,10 +866,12 @@ static void ov_vp9_acquire(Cpu *c) {
         *index = (uint32_t)got;
         if (fence) *fence = FENCE_TAG | (uint32_t)(d - decs) << 8 | (uint32_t)got;
         Slot *w;
+        if (d->is_h264) n += pics_out(d, wake + n, SLOTS * WAITERS - n, dirty, &ndirty);   // pictures already out first
         while (d->qn && (w = oldest_wait(d)) && n <= SLOTS * WAITERS - WAITERS) {
             Packet q = d->queue[d->qhead];
             d->qhead = (d->qhead + 1) % QUEUED, d->qn--;
-            n += decode_into(d, w, q.data, q.size, q.pts, q.end, wake + n);
+            n += d->is_h264 ? decode_h264(d, w, q.data, q.size, q.pts, q.end, wake + n, SLOTS * WAITERS - n, dirty, &ndirty)
+                            : decode_into(d, w, q.data, q.size, q.pts, q.end, wake + n, dirty, &ndirty);
             free(q.data);
         }
     }
@@ -499,6 +879,7 @@ static void ov_vp9_acquire(Cpu *c) {
     plat_mutex_unlock(&lock);
     if (got < 0) rt_log("codec: AcquireVp9DecoderOutputBuffer with every registered buffer reserved");
     else TRACE("acquire: buffer %d", got);
+    ni_notify_dirty(dirty, ndirty);
     for (int k = 0; k < n; k++) codec_signal_event(c, wake[k]);
     // A reserved buffer lets the next packet in: wake a player that waits for the submission-ready event after a not
     // ready submission. Without this, the tutorial's guide movies stopped at their second picture.
@@ -544,10 +925,7 @@ static void ov_read_nv12(Cpu *c) {
     uint8_t *ly = arg_p(c, 6), *luv = arg_p(c, 9);
     size_t yp = arg_x(c, 7), ys = arg_x(c, 8), uvp = arg_x(c, 10), uvs = arg_x(c, 11);
     plat_mutex_lock(&lock);
-    const Slot *s = NULL;
-    for (int k = 0; k < DECODERS && !s; k++)
-        for (int i = 0; decs[k].key && i < SLOTS && !s; i++)
-            if (decs[k].slot[i].pool == pool && decs[k].slot[i].nv12) s = &decs[k].slot[i];
+    const Slot *s = slot_for_pool_locked(pool);
     if (s) {
         uint32_t cx = x0 < s->w ? x0 : s->w, cy = y0 < s->h ? y0 : s->h;
         uint32_t rw = w < s->w - cx ? w : s->w - cx, rh = h < s->h - cy ? h : s->h - cy;
@@ -591,11 +969,32 @@ static void ov_read_nv12(Cpu *c) {
     ret_x(c, 0);
 }
 
-// NativeImageHandle GetDecoderImagePoolNativeImageHandle(const VideoDecoderImagePoolType *, u32): no GPU image
+// NativeImageHandle GetDecoderImagePoolNativeImageHandle(const VideoDecoderImagePoolType *, u32)
 static void ov_pool_image(Cpu *c) {
-    LOG_FIRST("codec: GetDecoderImagePoolNativeImageHandle %p #%u: no GPU image (the player's NV12 path is served)",
-              arg_p(c, 0), (unsigned)arg_x(c, 1));
-    ret_x(c, 0);
+    uint64_t pk = arg_x(c, 0);
+    uint32_t idx = (uint32_t)arg_x(c, 1);
+    const uint8_t *pool = arg_p(c, 0);
+    plat_mutex_lock(&lock);
+    NiEntry *e = NULL;
+    for (int i = 0; i < NI_MAX; i++)
+        if (ni_tab[i].pool == pk && ni_tab[i].image_idx == idx) { e = &ni_tab[i]; break; }
+    if (!e && pk) {
+        e = ni_alloc_locked();
+        if (e) {
+            uint16_t w = 0, h = 0;
+            if (pool) memcpy(&w, pool + 0x20, 2), memcpy(&h, pool + 0x22, 2);
+            e->handle = ni_next_handle_locked();
+            e->pool = pk;
+            e->image_idx = idx;
+            e->pref_w = w;
+            e->pref_h = h;
+        }
+    }
+    uint32_t hnd = e ? e->handle : 0;
+    plat_mutex_unlock(&lock);
+    LOG_FIRST("codec: GetDecoderImagePoolNativeImageHandle %p #%u -> %#x", arg_p(c, 0), idx, hnd);
+    TRACE("native image handle pool %#llx #%u -> %#x", (unsigned long long)pk, idx, hnd);
+    ret_x(c, hnd);
 }
 
 // ---- nn::syncpt::sdk: GPU sync point events (the decoder's output fences), not in the SDK's loaded modules. Each is a
@@ -622,10 +1021,20 @@ static void ov_sp_trywait(Cpu *c) {
     uint64_t ev = event_for(c, arg_x(c, 0));
     ret_x(c, rt_call(c, trywait, 1, ev) & 1);
 }
-// The host AV1/VP9 decoder completes synchronously before signaling its guest event, so any fence polled by the
-// movie event manager is already complete. The SDK implementation otherwise dispatches through the uninitialized
-// console sync-point service backend.
-static void ov_sp_trywait_handle(Cpu *c) { ret_x(c, 1); }
+// bool TryWaitSyncPoint(const SyncPointHandle &): a decoder fence (FENCE_TAG) is ready only once its output buffer
+// holds a decoded picture (not S_WAIT); non-decoder fences complete synchronously on the host.
+static void ov_sp_trywait_handle(Cpu *c) {
+    const uint32_t *h = arg_p(c, 0);
+    uint32_t tok = h ? *h : 0;
+    int ready = 1;
+    if ((tok & 0xffff0000u) == FENCE_TAG && ((tok >> 8) & 0xff) < DECODERS && (tok & 0xff) < SLOTS) {
+        plat_mutex_lock(&lock);
+        const Slot *s = &decs[(tok >> 8) & 0xff].slot[tok & 0xff];
+        if (s->state == S_WAIT) ready = 0;
+        plat_mutex_unlock(&lock);
+    }
+    ret_x(c, (uint64_t)ready);
+}
 static void clear_event(Cpu *c, uint64_t ev) {
     static uint64_t clear;
     if (!clear && !(clear = ldr_symbol("_ZN2nn2os16ClearSystemEventEPNS0_15SystemEventTypeE")))
@@ -669,6 +1078,11 @@ static void ov_sp_cancel(Cpu *c) {
 }
 // void DestroySyncPointEvent(SyncPointEventType *): the event stays bound for the next Create on the same object
 static void ov_sp_nop(Cpu *c) { (void)c; }
+static void ov_sp_make_from_nvrm(Cpu *c) {
+    uint32_t id = (uint32_t)arg_x(c, 0), val = (uint32_t)arg_x(c, 1);
+    c->x[0] = (uint64_t)id | ((uint64_t)val << 32);
+    c->x[1] = 0;
+}
 
 HOST_OVERRIDE("_ZN2nn5codec5video10InitializeEv", ov_video_init);
 HOST_OVERRIDE("_ZN2nn5codec5video8FinalizeEv", ov_video_fini);
@@ -702,9 +1116,11 @@ HOST_OVERRIDE("_ZN2nn5codec20InitializeVp8DecoderEPNS0_14Vp8DecoderTypeEPvmmttjN
 HOST_OVERRIDE("_ZN2nn5codec20InitializeVp8DecoderEPNS0_14Vp8DecoderTypeEmmttjNS0_23VideoDecoderInputFormatENS0_"
               "24VideoDecoderOutputFormatE", ov_vp8_init_nowork);
 HOST_OVERRIDE("_ZN2nn5codec21InitializeH264DecoderEPNS0_15H264DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_"
-              "24VideoDecoderOutputFormatEPKvm", ov_h264_unsupported);
+              "24VideoDecoderOutputFormatEPKvm", ov_h264_init);
 HOST_OVERRIDE("_ZN2nn5codec21InitializeH264DecoderEPNS0_15H264DecoderTypeEmmttjNS0_23VideoDecoderInputFormatENS0_"
-              "24VideoDecoderOutputFormatEPKvm", ov_h264_unsupported);
+              "24VideoDecoderOutputFormatEPKvm", ov_h264_init_nowork);
+HOST_OVERRIDE("_ZN2nn5codec21InitializeH264DecoderEPNS0_15H264DecoderTypeEmttjNS0_23VideoDecoderInputFormatENS0_"
+              "24VideoDecoderOutputFormatEPKvm", ov_h264_init_1sz);
 HOST_OVERRIDE("_ZN2nn5codec18FinalizeVp9DecoderEPNS0_14Vp9DecoderTypeE", ov_vp9_fini);
 HOST_OVERRIDE("_ZN2nn5codec15StartVp9DecoderEPNS0_14Vp9DecoderTypeE", ov_vp9_start);
 HOST_OVERRIDE("_ZN2nn5codec14StopVp9DecoderEPNS0_14Vp9DecoderTypeE", ov_ok);
@@ -716,8 +1132,8 @@ HOST_OVERRIDE("_ZN2nn5codec26InitializeDecoderImagePoolEPNS0_25VideoDecoderImage
 // SDK 20's ExeFS import drops the legacy buffer-count and CodecMode parameters.
 HOST_OVERRIDE("_ZN2nn5codec26InitializeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTypeEPvmRKNS0_27VideoDecoderImage"
               "PreferenceE", ov_pool_init);
-HOST_OVERRIDE("_ZN2nn5codec24FinalizeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTypeE", ov_ok);
-HOST_OVERRIDE("_ZN2nn5codec31CalculateDecoderImagePoolBufferEPmS1_RKNS0_27VideoDecoderImagePreferenceEj", ov_calc_size);
+HOST_OVERRIDE("_ZN2nn5codec24FinalizeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTypeE", ov_pool_fini);
+HOST_OVERRIDE("_ZN2nn5codec31CalculateDecoderImagePoolBufferEPmS1_RKNS0_27VideoDecoderImagePreferenceEj", ov_calc_pool_size);
 HOST_OVERRIDE("_ZN2nn5codec29CalculateVp9DecoderWorkBufferEPmS1_mtt", ov_calc_size);
 HOST_OVERRIDE("_ZN2nn5codec33GetVp9DecoderSubmissionReadyEventEPPNS_2os15SystemEventTypeEPNS0_14Vp9DecoderTypeE",
               ov_vp9_ready_event);
@@ -741,6 +1157,7 @@ HOST_OVERRIDE("_ZN2nn6syncpt3sdk21RequestSyncPointEventEPNS1_18SyncPointEventTyp
               ov_sp_request);
 HOST_OVERRIDE("_ZN2nn6syncpt3sdk20CancelSyncPointEventEPNS1_18SyncPointEventTypeE", ov_sp_cancel);
 HOST_OVERRIDE("_ZN2nn6syncpt3sdk21DestroySyncPointEventEPNS1_18SyncPointEventTypeE", ov_sp_nop);
+HOST_OVERRIDE("_ZN2nn6syncpt3sdk32MakeSyncPointHandleFromNvRmFenceEjj", ov_sp_make_from_nvrm);
 // Result Get{Vp9,Av1}DecoderOutputBufferProperties(u16 *w, u16 *h, u16 *, u16 *, TimeSpan *pts, bool *end, Type *, u32 index)
 // (Switch 2 SDK 20: no ColorSpace argument)
 static void ov_props2(Cpu *c) {
@@ -798,8 +1215,8 @@ static void ov_unregister(Cpu *c) {
 CODEC_SDK20("Av1", ov_av1_init_tm, ov_av1_init_rm);
 CODEC_SDK20("Vp9", ov_vp9_init_tm, ov_vp9_init_rm);
 CODEC_SDK20("Vp8", ov_vp8_init_tm, ov_vp8_init_rm);
-HOST_OVERRIDE("_ZN2nn5codec37InitializeH264DecoderByTransferMemoryEPNS0_15H264DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeEPKvm", ov_h264_unsupported);
-HOST_OVERRIDE("_ZN2nn5codec35InitializeH264DecoderByRemoteMemoryEPNS0_15H264DecoderTypeEmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeEPKvm", ov_h264_unsupported);
+HOST_OVERRIDE("_ZN2nn5codec37InitializeH264DecoderByTransferMemoryEPNS0_15H264DecoderTypeEPvmmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeEPKvm", ov_h264_init_tm);
+HOST_OVERRIDE("_ZN2nn5codec35InitializeH264DecoderByRemoteMemoryEPNS0_15H264DecoderTypeEmttjNS0_23VideoDecoderInputFormatENS0_24VideoDecoderOutputFormatENS0_22VideoDecoderOutputModeEPKvm", ov_h264_init_rm);
 HOST_OVERRIDE("_ZN2nn5codec19FinalizeH264DecoderEPNS0_15H264DecoderTypeE", ov_vp9_fini);
 HOST_OVERRIDE("_ZN2nn5codec16StartH264DecoderEPNS0_15H264DecoderTypeE", ov_vp9_start);
 HOST_OVERRIDE("_ZN2nn5codec15StopH264DecoderEPNS0_15H264DecoderTypeE", ov_ok);
@@ -807,6 +1224,10 @@ HOST_OVERRIDE("_ZN2nn5codec16FlushH264DecoderEPNS0_15H264DecoderTypeE", ov_vp9_f
 HOST_OVERRIDE("_ZN2nn5codec25RegisterH264DecoderBufferEPNS0_15H264DecoderTypeEjPNS0_25VideoDecoderImagePoolTypeEj", ov_vp9_register);
 HOST_OVERRIDE("_ZN2nn5codec27UnregisterH264DecoderBufferEPNS0_15H264DecoderTypeEj", ov_unregister);
 HOST_OVERRIDE("_ZN2nn5codec34GetH264DecoderSubmissionReadyEventEPNS0_15H264DecoderTypeE", ov_ready2);
+// The older SDK form: Result Get...(SystemEventType **out, H264DecoderType *)
+HOST_OVERRIDE("_ZN2nn5codec34GetH264DecoderSubmissionReadyEventEPPNS_2os15SystemEventTypeEPNS0_15H264DecoderTypeE",
+              ov_vp9_ready_event);
+HOST_OVERRIDE("_ZN2nn5codec30CalculateH264DecoderWorkBufferEPmS1_mtt", ov_calc_size);
 HOST_OVERRIDE("_ZN2nn5codec28SubmitH264DecoderInputBufferEPmPNS0_15H264DecoderTypeEPKvmNS_8TimeSpanEb", ov_vp9_submit);
 HOST_OVERRIDE("_ZN2nn5codec30AcquireH264DecoderOutputBufferEPjPNS_2gs16NativeSyncHandleEPNS0_15H264DecoderTypeE", ov_vp9_acquire);
 HOST_OVERRIDE("_ZN2nn5codec30ReleaseH264DecoderOutputBufferEPNS0_15H264DecoderTypeEjNS_2gs16NativeSyncHandleE", ov_vp9_release);

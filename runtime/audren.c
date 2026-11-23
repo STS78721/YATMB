@@ -465,6 +465,9 @@ static void renderer_close(void *p) {
 // 2 returns an IAudioRendererManager. 0 (IAudioInManager), 1 (IAudioOutManager), 3 and 4 are not served yet.
 void aud_user_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs) {
     switch (rq->cmd) {
+    case 1:
+        rs->move[rs->nmove++] = ipc_session_new("audout:u", audout_manager_handler, NULL, NULL);
+        return;
     case 2:
         rs->move[rs->nmove++] = ipc_session_new("audren:u", audren_manager_handler, NULL, NULL);
         return;

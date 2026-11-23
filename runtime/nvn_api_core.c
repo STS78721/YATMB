@@ -171,6 +171,8 @@ static int pool_place(pool_t *o) {
 static int pool_gpu_visible(const pool_t *o) { return !(o->flags & NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS); }
 
 // ---------- Device
+static NVNdevice *default_dev;
+NVNdevice *nvn_default_device(void) { return __atomic_load_n(&default_dev, __ATOMIC_ACQUIRE); }
 static const int devinfo[] = {   // Tegra X1 values (nnheaders nvn_DeviceConstantsNX.h, measured on SMO)
     // ABI: Donkey Kong Bananza (NVN 2) requires major 231 and minor >= 16 (main+0x5b29a4, the check before the sead
     // graphics set-up); OOT (SDK 20.x NVN 2) requires major 231 and minor >= 40 (main+0x340b498); TotK required 55 and >= 15.
@@ -200,11 +202,17 @@ NVN_API(nvnDeviceInitialize) {
     memset(o, 0, sizeof *o);
     o->magic = DEV_MAGIC;
     o->flags = b->flags;
+    __atomic_store_n(&default_dev, (NVNdevice *)o, __ATOMIC_RELEASE);
     NVN_LOG("DeviceInitialize %p flags %#x, back end %s", (void *)o, o->flags, gfx_backend()->name);
     ret_x(c, 1);
 }
 // void nvnDeviceFinalize(NVNdevice *d)
-NVN_API(nvnDeviceFinalize) { ((dev_t_ *)arg_p(c, 0))->magic = 0; }
+NVN_API(nvnDeviceFinalize) {
+    NVNdevice *d = arg_p(c, 0);
+    NVNdevice *expected = d;
+    __atomic_compare_exchange_n(&default_dev, &expected, NULL, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    ((dev_t_ *)d)->magic = 0;
+}
 // void nvnDeviceGetInteger(const NVNdevice *d, NVNdeviceInfo what, int *out)
 NVN_API(nvnDeviceGetInteger) {
     unsigned w = (unsigned)arg_x(c, 1);
@@ -216,7 +224,9 @@ NVN_API(nvnDeviceGetInteger) {
     }
     if (w >= sizeof devinfo / sizeof *devinfo) {   // NVN 2 properties past the NVN 1 table: 0 (feature absent) until known
         if (w > 0x100) rt_fatal("nvn: unsupported NVN device property %#x", w);
-        rt_log("nvn: NVN 2 device property %#x not known, answering 0", w);
+        char from[128];
+        rt_log("nvn: NVN 2 device property %#x not known, answering 0 (asked from %s)", w,
+               ldr_describe(c->x[30], from, sizeof from));
         *out = 0;
         return;
     }
@@ -284,19 +294,12 @@ NVN_API(nvnMemoryPoolBuilderSetStorage) {
 }
 // void nvnMemoryPoolBuilderSetFlags(NVNmemoryPoolBuilder *b, int flags)
 NVN_API(nvnMemoryPoolBuilderSetFlags) { ((pool_builder_t *)arg_p(c, 0))->flags = (uint32_t)arg_x(c, 1); }
-// NVNboolean nvnMemoryPoolInitialize(NVNmemoryPool *p, const NVNmemoryPoolBuilder *b)
-// Pool setup imports, mirrors and maps memory in the back end (the driver, VirtualAlloc): up to 20 ms on the game's
-// loader threads, which held a virtual core through it while job workers waited (TOTK_CORE_DIAG). The thread gives
-// the core up, as for any blocking host call.
-NVN_API(nvnMemoryPoolInitialize) {
-    NVN_BLOCKING();
-    pool_t *o = arg_p(c, 0);
-    const pool_builder_t *s = arg_p(c, 1);
+int nvn_pool_init_host(pool_t *o, void *mem, uint64_t size, uint32_t flags) {
     memset(o, 0, sizeof *o);
     o->magic = NVN_POOL_MAGIC;
-    o->flags = s->flags;
-    o->mem = o->game_mem = s->mem;
-    o->size = s->size;
+    o->flags = flags;
+    o->mem = o->game_mem = mem;
+    o->size = size;
     int ok = pool_place(o);
     if (ok && !o->mem) {
         rt_log("nvn: MemoryPoolInitialize: pool without storage, flags %#x size %#llx", o->flags,
@@ -315,19 +318,33 @@ NVN_API(nvnMemoryPoolInitialize) {
     }
     NVN_LOG("MemoryPool %p mem %p size %#llx flags %#x storage %p%s", (void *)o, (void *)o->mem,
             (unsigned long long)o->size, o->flags, (void *)o->game_mem, ok ? "" : " failed");
-    ret_x(c, ok);
+    return ok;
 }
-// void nvnMemoryPoolFinalize(NVNmemoryPool *p)
-NVN_API(nvnMemoryPoolFinalize) {
-    NVN_BLOCKING();   // as nvnMemoryPoolInitialize
-    pool_t *o = arg_p(c, 0);
-    if (o->magic != NVN_POOL_MAGIC) return;
+
+void nvn_pool_fini_host(pool_t *o) {
+    if (!o || o->magic != NVN_POOL_MAGIC) return;
     if (pool_gpu_visible(o)) index_del(o);
     gfx_backend()->pool_fini(o);
     if (nvn_gpu_only((uintptr_t)o->mem)) gva_free((uintptr_t)o->mem);
     o->mem = o->game_mem;
     o->span = 0;
     o->magic = 0;
+}
+
+// NVNboolean nvnMemoryPoolInitialize(NVNmemoryPool *p, const NVNmemoryPoolBuilder *b)
+// Pool setup imports, mirrors and maps memory in the back end (the driver, VirtualAlloc): up to 20 ms on the game's
+// loader threads, which held a virtual core through it while job workers waited (TOTK_CORE_DIAG). The thread gives
+// the core up, as for any blocking host call.
+NVN_API(nvnMemoryPoolInitialize) {
+    NVN_BLOCKING();
+    pool_t *o = arg_p(c, 0);
+    const pool_builder_t *s = arg_p(c, 1);
+    ret_x(c, (uint64_t)nvn_pool_init_host(o, s->mem, s->size, s->flags));
+}
+// void nvnMemoryPoolFinalize(NVNmemoryPool *p)
+NVN_API(nvnMemoryPoolFinalize) {
+    NVN_BLOCKING();   // as nvnMemoryPoolInitialize
+    nvn_pool_fini_host(arg_p(c, 0));
 }
 static uint64_t flush_stat[2][3][2];   // nvn_flush_stats
 
@@ -510,6 +527,43 @@ NVN_API(nvnSyncWait) {
     if (ok) b->cpu_synced(s->fence);
     ret_x(c, ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED);
 }
+// NVNboolean nvnSyncGetNvRmSyncNVX(const NVNsync *s, void *nvrm_sync): populate an inline NvRmSync block compatible
+// with sdk's NvRmSyncClose (+0x08 == 1) and NvRmSyncExtractSyncpoint (+0x0c count, +0x10 cap, +0x24 NvRmFenceRec),
+// carrying host fence metadata in +0x30..+0x3f of the 64-byte struct.
+NVN_API(nvnSyncGetNvRmSyncNVX) {
+    const sync_t *s = arg_p(c, 0);
+    uint8_t *rm = arg_p(c, 1);
+    if (!s || !rm) { ret_x(c, 0); return; }
+    memset(rm, 0, 64);
+    uint32_t one = 1u, fval = (uint32_t)(s->fence & 0xffffffffu), magic = SYNC_MAGIC;
+    memcpy(rm + 0x08, &one, 4);
+    memcpy(rm + 0x0c, &one, 4);
+    memcpy(rm + 0x10, &one, 4);
+    memcpy(rm + 0x24, &one, 4);
+    memcpy(rm + 0x28, &fval, 4);
+    memcpy(rm + 0x30, &s->fence, 8);
+    memcpy(rm + 0x38, &s->fenced, 4);
+    memcpy(rm + 0x3c, &magic, 4);
+    ret_x(c, 1);
+}
+// NVNboolean nvnSyncInitializeFromNvRmSyncNVX(NVNsync *s, NVNdevice *d, const void *nvrm_sync)
+NVN_API(nvnSyncInitializeFromNvRmSyncNVX) {
+    sync_t *s = arg_p(c, 0);
+    const uint8_t *rm = arg_p(c, 2);
+    if (!s || !rm) { ret_x(c, 0); return; }
+    uint32_t magic = 0;
+    memcpy(&magic, rm + 0x3c, 4);
+    memset(s, 0, sizeof *s);
+    s->magic = SYNC_MAGIC;
+    if (magic == SYNC_MAGIC) {
+        memcpy(&s->fence, rm + 0x30, 8);
+        memcpy(&s->fenced, rm + 0x38, 4);
+    } else {
+        s->fenced = 1;
+        s->fence = nvn_fence_last();
+    }
+    ret_x(c, 1);
+}
 // void nvnEventBuilderSetDefaults(NVNeventBuilder *b)
 NVN_API(nvnEventBuilderSetDefaults) { memset(arg_p(c, 0), 0, sizeof(ev_builder_t)); }
 // void nvnEventBuilderSetStorage(NVNeventBuilder *b, const NVNmemoryPool *p, int64_t offset)
@@ -622,21 +676,26 @@ NVN_API(nvnQueueSubmitCommands) {
     q->submits++;
     uint64_t f;
     if (gfx_replay_async()) {
-        // Prepare and queue under one lock: submit numbers follow queue order (gfx_replayed_submits).
+        // Prepare and queue under one lock: submit numbers follow queue order (gfx_replayed_submits), and last_fence
+        // is published before unlocking so a concurrent QueueFenceSync never reads an older fence.
         static PlatMutex submit_lock = PLAT_MUTEX_INIT;
         uint64_t local[32], *hs = n <= 32 ? local : malloc(sizeof *hs * (size_t)n);
         if (!hs) rt_fatal("nvn: out of memory (submit of %d handles)", n);
         plat_mutex_lock(&submit_lock);
         nvn_submit_prepare_async(h, hs, n);
         f = gfx_backend()->submit(hs, n, submitted);
+        nvn_submit_fence_syncs(hs, n, f);
+        uint64_t prev = __atomic_load_n(&last_fence, __ATOMIC_RELAXED);
+        while (f > prev && !__atomic_compare_exchange_n(&last_fence, &prev, f, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
         plat_mutex_unlock(&submit_lock);
         if (hs != local) free(hs);
     } else {
         nvn_submit_prepare(h, n);
         f = gfx_backend()->submit(h, n, submitted);
+        nvn_submit_fence_syncs(h, n, f);
+        uint64_t prev = __atomic_load_n(&last_fence, __ATOMIC_RELAXED);
+        while (f > prev && !__atomic_compare_exchange_n(&last_fence, &prev, f, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
     }
-    uint64_t prev = __atomic_load_n(&last_fence, __ATOMIC_RELAXED);
-    while (f > prev && !__atomic_compare_exchange_n(&last_fence, &prev, f, 1, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
     __atomic_store_n(&lod_fence[no % LOD_RING], f, __ATOMIC_RELAXED);
     __atomic_store_n(&lod_issued, no, __ATOMIC_SEQ_CST);
 }

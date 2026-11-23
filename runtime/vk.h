@@ -249,6 +249,7 @@ void vk_mem_pick(VkMemSpan *sp);
 #define VK_MEM_USE(sp) do { if (vk_mirror_on && (sp).pool) vk_mem_use(&(sp)); } while (0)
 #define VK_MEM_PICK(sp) do { if (vk_mirror_on && (sp).pool) vk_mem_pick(&(sp)); } while (0)
 void vk_mem_gpu_wrote(const VkMemSpan *sp, uint64_t size);
+void vk_mem_guarded_write(VkCommandBuffer cb, const VkMemSpan *sp);
 // Uniform blocks as of the submit call (vk_usnap.c): vk_exec_record copies the uniform ranges a submission binds before
 // it records (or vk_usnap_take captures them on the submitting thread when TOTK_REPLAY_ASYNC=1), ubo bindings take the
 // copy (0: not copied, bind memory), GPU writes of the replay drop the copies they touch.
@@ -321,8 +322,10 @@ VkQueryPool vk_ts_pool(uint32_t pairs, float *period);
 // Deferred destruction: freed once the upload batches recorded so far and the timeline value last noted have completed.
 void vk_defer_image(VkImage img, VmaAllocation alloc);   // alloc NULL: vkDestroyImage only
 void vk_defer_view(VkImageView view);
+void vk_defer_buffer_view(VkBufferView view);
 void vk_exec_image_gone(VkImage image);   // destroy_tex, texture lock held: the replay's views of image go with it
 void vk_defer_buffer(VkBuffer buf, VmaAllocation alloc);
+void vk_exec_buffer_gone(VkBuffer buf);
 // ---- ASTC (vk_astc.c). TOTK_ASTC = auto | gpu | native | cpu | check; see vk_astc.c.
 enum { VK_ASTC_CPU, VK_ASTC_GPU, VK_ASTC_NATIVE, VK_ASTC_CHECK };
 int vk_astc_mode(void);                 // decided once per device (logged); VK_ASTC_CPU before vk_init
@@ -403,6 +406,8 @@ const VkTexImage *vk_texture_by_id(const dpool_ref *pool, int id, view_t *view, 
 void vk_texture_lock(void);
 void vk_texture_unlock(void);
 const VkTexImage *vk_texture_by_id_locked(const dpool_ref *pool, int id, view_t *view, int *has_view);
+int vk_texture_buffer_desc_locked(const dpool_ref *pool, int id, uint64_t *addr, uint64_t *size, VkFormat *vk_fmt,
+                                  uint32_t *bpb, int storage);
 VkSampler vk_sampler_by_id_locked(const dpool_ref *pool, int id);
 // The slot's sampler with nearest filtering and no anisotropy: a depth texture read without a compare lands on one texel
 // on the Switch although the game binds a linear sampler, and MacNativeGames samples it the same way. VK_NULL_HANDLE
@@ -419,7 +424,8 @@ uint32_t vk_texture_slots_gen(void);
 uint64_t vk_texture_slot_token(const dpool_ref *pool, int id);
 uint32_t vk_sampler_gen(void);                      // changes whenever a sampler slot is registered
 void vk_texture_gpu_written(const tex_t *t);        // rendered or copied into by the GPU: no re-upload from storage
-void vk_texture_storage_bound_locked(const VkTexImage *img);   // bound as a storage image in the recording submission
+void vk_texture_gpu_written_level(const tex_t *t, uint32_t level);   // single mip level copied/cleared by the GPU
+void vk_texture_storage_bound_locked(const VkTexImage *img, int written);   // bound as a storage image in the recording submission
 uint64_t vk_texture_last_write(const tex_t *t);    // timeline value of the newest submission recorded to write it; 0: none
 size_t vk_texture_texel_span(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint64_t row, uint64_t img);   // bytes ReadTexels spans; 0 for a bad region
 int vk_texture_small_dirty(void);                   // a small mirrored target holds GPU texels its storage lacks

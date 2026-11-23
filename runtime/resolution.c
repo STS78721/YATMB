@@ -238,7 +238,7 @@ void res_init(void) {
     if (!game_profile_has(GAME_QUIRK_TOTK_PATCH_RES)) {
         const RtGameProfile *gp = game_profile();
         int is_mtf = (gp->short_name && !strcmp(gp->short_name, "mtf"));
-        int lines = is_mtf ? mtf_latch_boot_lines() : 0;
+        int lines = mtf_latch_boot_lines();
         rt_log("resolution: Universal NS2 live hooks active for %s (Docked %ux%u, Handheld %ux%u)",
                gp->display_name, gp->docked_w, gp->docked_h, gp->handheld_w, gp->handheld_h);
         if (is_mtf) {
@@ -362,13 +362,6 @@ void res_display_size(unsigned out[2]) {
         }
         return;
     }
-    uint32_t cw = __atomic_load_n(&g_live_crop_w, __ATOMIC_RELAXED);
-    uint32_t ch = __atomic_load_n(&g_live_crop_h, __ATOMIC_RELAXED);
-    if (cw >= 640 && ch >= 360) {
-        out[0] = cw;
-        out[1] = ch;
-        return;
-    }
     uint32_t tw = 0, th = 0;
     res_mtf_size(&tw, &th);
     if (tw && th) {
@@ -376,8 +369,18 @@ void res_display_size(unsigned out[2]) {
         out[1] = th;
         return;
     }
-    out[0] = game_profile()->docked_w;
-    out[1] = game_profile()->docked_h;
+    const RtGameProfile *gp = game_profile();
+    if (gp && gp->short_name && !strcmp(gp->short_name, "mtf")) {
+        uint32_t cw = __atomic_load_n(&g_live_crop_w, __ATOMIC_RELAXED);
+        uint32_t ch = __atomic_load_n(&g_live_crop_h, __ATOMIC_RELAXED);
+        if (cw >= 640 && ch >= 360) {
+            out[0] = cw;
+            out[1] = ch;
+            return;
+        }
+    }
+    out[0] = gp->docked_w;
+    out[1] = gp->docked_h;
 }
 
 void res_sizes(unsigned out[2], unsigned scene[2]) {
@@ -738,6 +741,148 @@ void __wrap_f_7000075cc0(Cpu *c) {
     if (__real_f_7000075cc0) __real_f_7000075cc0(c);
     else {
         GuestFn orig = rt_dispatch_lookup(0x7000075cc0ull);
+        if (orig) orig(c);
+    }
+}
+
+// ---- UE5 Console-Variable Resolution Hooks (GAME_QUIRK_UE5_CVAR_RES)
+// Drives NS2_RESOLUTION natively through UE5's IConsoleManager (r.SetRes, r.DynamicRes.OperationMode,
+// r.ScreenPercentage, r.SecondaryScreenPercentage.GameViewport) right after the engine applies its
+// docked/handheld DeviceProfile so backbuffers, RDG scene targets, TSR, and Slate UI all scale cleanly.
+extern void __real_f_700049829c(Cpu *c) __attribute__((weak));
+extern void __real_f_700582d83c(Cpu *c) __attribute__((weak));
+extern void __real_f_7002d7a41c(Cpu *c) __attribute__((weak));
+
+static void ue5_cvar_set_ascii(Cpu *c, uint64_t mgr, const char *name, const char *val) {
+    if (!mgr || !name || !val) return;
+    uint16_t name_u16[96], val_u16[64];
+    size_t i = 0;
+    for (; i + 1 < sizeof name_u16 / sizeof name_u16[0] && name[i]; i++) name_u16[i] = (uint8_t)name[i];
+    name_u16[i] = 0;
+    size_t j = 0;
+    for (; j + 1 < sizeof val_u16 / sizeof val_u16[0] && val[j]; j++) val_u16[j] = (uint8_t)val[j];
+    val_u16[j] = 0;
+
+    uint64_t vt = LD64(mgr);
+    if (!vt || !plat_mem_readable(vt + 0xb8ull, 8)) return;
+    uint64_t find_fn = LD64(vt + 0xb8ull);
+    if (!find_fn) return;
+    c->x[0] = mgr;
+    c->x[1] = (uint64_t)(uintptr_t)name_u16;
+    c->x[2] = 1ull;
+    c->pc = find_fn;
+    rt_dispatch(c);
+    uint64_t cvar = c->x[0];
+    if (!cvar || !plat_mem_readable(cvar, 8)) return;
+    uint64_t cvt = LD64(cvar);
+    if (!cvt || !plat_mem_readable(cvt + 0x90ull, 8)) return;
+    uint64_t set_fn = LD64(cvt + 0x90ull);
+    if (!set_fn) return;
+    c->x[0] = cvar;
+    c->x[1] = (uint64_t)(uintptr_t)val_u16;
+    c->x[2] = 0x0d000000ull;   // ECVF_SetByConsole (overrides DeviceProfile / Scalability)
+    c->x[3] = 0ull;
+    c->pc = set_fn;
+    rt_dispatch(c);
+}
+
+void __wrap_f_700049829c(Cpu *c) {
+    if (__real_f_700049829c) __real_f_700049829c(c);
+    else {
+        GuestFn orig = rt_dispatch_lookup(0x700049829cull);
+        if (orig) orig(c);
+    }
+    if (!game_profile_has(GAME_QUIRK_UE5_CVAR_RES)) return;
+    int lines = res_mtf_lines();
+    if (lines <= 0) return;
+    if (!plat_mem_readable(0x7009635d70ull, 8)) return;
+    uint64_t mgr = LD64(0x7009635d70ull);
+    if (!mgr) return;
+
+    uint32_t th = (uint32_t)lines & ~1u;
+    uint32_t tw = ((uint32_t)lines * 16u / 9u) & ~1u;
+    int pct = 100;
+    const char *rs = cfg_value("NS2_RENDER_SCALE");
+    if (rs && strcmp(rs, "game")) {
+        int v = atoi(rs);
+        if (v >= 25 && v <= 200) pct = v;
+    }
+    char res_buf[32], pct_buf[16];
+    snprintf(res_buf, sizeof res_buf, "%ux%uf", tw, th);
+    snprintf(pct_buf, sizeof pct_buf, "%d", pct);
+
+    uint64_t saved_x[31];
+    uint64_t saved_pc = c->pc;
+    memcpy(saved_x, c->x, sizeof saved_x);
+
+    ue5_cvar_set_ascii(c, mgr, "r.SetRes", res_buf);
+    ue5_cvar_set_ascii(c, mgr, "r.DynamicRes.OperationMode", "0");
+    ue5_cvar_set_ascii(c, mgr, "r.ScreenPercentage", pct_buf);
+    ue5_cvar_set_ascii(c, mgr, "r.SecondaryScreenPercentage.GameViewport", "100");
+
+    memcpy(c->x, saved_x, sizeof saved_x);
+    c->pc = saved_pc;
+    rt_log("resolution: UE5 CVar target %ux%u (NS2_RESOLUTION=%d, ScreenPercentage=%d%%, DynamicRes=off)",
+           tw, th, lines, pct);
+}
+
+void __wrap_f_700582d83c(Cpu *c) {
+    if (game_profile_has(GAME_QUIRK_UE5_CVAR_RES) && res_mtf_lines() > 0) {
+        if (c->x[0] && plat_mem_readable(c->x[0] + 0x39ull, 1))
+            ST8(c->x[0] + 0x39ull, (uint32_t)c->x[1]);
+        static int logged;
+        if (!logged) {
+            logged = 1;
+            rt_log("resolution: skipped internal UE5 r.SetRes preset %u (NS2_RESOLUTION=%d active)",
+                   (unsigned)(c->x[1] & 0xffu), res_mtf_lines());
+        }
+        return;
+    }
+    if (__real_f_700582d83c) __real_f_700582d83c(c);
+    else {
+        GuestFn orig = rt_dispatch_lookup(0x700582d83cull);
+        if (orig) orig(c);
+    }
+}
+
+void __wrap_f_7002d7a41c(Cpu *c) {
+    if (game_profile_has(GAME_QUIRK_UE5_CVAR_RES) && res_mtf_lines() > 1080) {
+        int32_t w = (int32_t)(c->x[1] & 0xffffffffull);
+        int32_t h = (int32_t)((c->x[1] >> 32) & 0xffffffffull);
+        if (w > 1920 && h > 1080) {
+            static float base_1080_dpi = 0.0f;
+            if (base_1080_dpi <= 0.0f) {
+                uint64_t saved_x0 = c->x[0], saved_x1 = c->x[1], saved_lr = c->x[30];
+                c->x[1] = (1080ull << 32) | 1920ull;
+                if (__real_f_7002d7a41c) __real_f_7002d7a41c(c);
+                else {
+                    GuestFn orig = rt_dispatch_lookup(0x7002d7a41cull);
+                    if (orig) orig(c);
+                }
+                uint32_t b = (uint32_t)c->v[0];
+                memcpy(&base_1080_dpi, &b, sizeof base_1080_dpi);
+                if (base_1080_dpi < 0.25f || base_1080_dpi > 4.0f) base_1080_dpi = 1.0f;
+                c->x[0] = saved_x0;
+                c->x[1] = saved_x1;
+                c->x[30] = saved_lr;
+            }
+            float sx = (float)w / 1920.0f;
+            float sy = (float)h / 1080.0f;
+            float dpi = base_1080_dpi * (sx < sy ? sx : sy);
+            uint32_t bits;
+            memcpy(&bits, &dpi, sizeof bits);
+            c->v[0] = (uint64_t)bits;
+            static float logged_dpi;
+            if (logged_dpi != dpi) {
+                logged_dpi = dpi;
+                rt_log("resolution: UE5 UI DPI scale %.3f for %dx%d (1080p baseline %.3f)", dpi, w, h, base_1080_dpi);
+            }
+            return;
+        }
+    }
+    if (__real_f_7002d7a41c) __real_f_7002d7a41c(c);
+    else {
+        GuestFn orig = rt_dispatch_lookup(0x7002d7a41cull);
         if (orig) orig(c);
     }
 }

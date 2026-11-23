@@ -20,6 +20,7 @@
 // as x/2+1/2, UNORM and sRGB bytes written as stored. Caps: MAX_PASSES passes copied, PNG_CAP bytes of PNGs.
 // TOTK_DUMP_TEX=<id>|<w>x<h>[,...]: those texture slots, or 2D textures of that size, are copied where first sampled,
 // whatever their format.
+// TOTK_DUMP_UBO_VEC=<slot>:<vec4>[,...] adds those vec4 (any index) and turns TOTK_DUMP_UBO on.
 // TOTK_DUMP_UBO=1: each listed pipeline also prints the first 16 vec4 of its user uniform blocks (c3 and up), read from
 // guest memory when the entry is listed. A block the submission rewrites with UpdateUniformBuffer shows its value from
 // before the submission (vk_exec_draw.c upd_note).
@@ -50,7 +51,9 @@ static uint64_t dump_frame, log_from;   // log_from: TOTK_DUMP_LOG, first frame 
 static char dir[400];
 static FILE *passes_f, *images_f;
 static int seq, finished, copied;      // copied: passes and dispatches of the dump frame whose images were copied
-static int skip_runs, dump_ubo;        // TOTK_DUMP_SKIP_RUNS, TOTK_DUMP_UBO
+static int skip_runs, dump_ubo;
+static struct { int slot; unsigned vec; } ubo_vec[16];   // TOTK_DUMP_UBO_VEC
+static int n_ubo_vec;        // TOTK_DUMP_SKIP_RUNS, TOTK_DUMP_UBO
 static uint32_t want_tex[16][2];       // TOTK_DUMP_TEX: slot id and 0, or width and height
 static int nwant_tex;
 static uint64_t last_targets;          // targets_sig of the last render pass; 0 after a dispatch
@@ -357,6 +360,10 @@ static const char *copy_out(VkExec *ex, VkImage image, VkFormat vf, VkImageAspec
 // `stride` bytes at `off` (each record a letter: its value's index in the table under the map).
 
 static uint64_t bd_addr, bd_size, bd_off, bd_stride;
+// TOTK_DUMP_BUF=ubo:<cbuf slot>:<byte offset>:<size>: the range is the first storage buffer a logged draw or dispatch
+// reads through that user uniform block word (its address differs between runs), from where it is found on.
+static int bd_ubo_slot = -1;
+static uint64_t bd_ubo_off, bd_ubo_size;
 static uint32_t bd_w, bd_h;
 static uint8_t *bd_prev;
 static FILE *bufs_f;
@@ -577,6 +584,26 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
             for (int k = 0; k < 16; k++)
                 if (ex->ssbo[st][k].addr)
                     sp(b, " %d=%#llx+%#llx", k, (unsigned long long)ex->ssbo[st][k].addr, (unsigned long long)ex->ssbo[st][k].size);
+            uint64_t pa = vk_exec_ubo_ptr(ex, st, r);
+            if (pa) {   // read through a user uniform block: where it points and its first words
+                VkMemSpan ms;
+                sp(b, " -> %#llx", (unsigned long long)pa);
+                if (bd_ubo_slot == r->cbuf_slot && bd_ubo_off == (uint64_t)r->handle * 4 && !bd_size) {
+                    char path[600];
+                    snprintf(path, sizeof path, "%s/bufs.txt", dir);
+                    if ((bufs_f = fopen(path, "w"))) {
+                        bd_addr = pa, bd_size = bd_ubo_size;
+                        fprintf(bufs_f, "range %#llx+%#llx (c%d+%#llx of a %s)\n", (unsigned long long)pa,
+                                (unsigned long long)bd_size, bd_ubo_slot, (unsigned long long)bd_ubo_off, stn[st]);
+                    }
+                }
+                if (vk_mem_resolve(pa, 32, &ms)) {
+                    const float *f = (const float *)(uintptr_t)pa;
+                    sp(b, " [%g %g %g %g %g %g %g %g]", f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
+                } else {
+                    sp(b, " (not mapped)");
+                }
+            }
             sp(b, "\n");
             continue;
         }
@@ -587,10 +614,19 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
             sp(b, "    %s ubo c%d addr %#llx size %#llx", stn[st], r->slot, (unsigned long long)u->addr, (unsigned long long)u->size);
             if (u->addr && vk_mem_resolve(u->addr, 1, &ms)) {
                 uint64_t n = u->size && u->size < ms.avail ? u->size : ms.avail;
-                const float *f = (const float *)(uintptr_t)u->addr;
-                for (uint64_t k = 0; k < 16 && (k + 1) * 16 <= n; k++)
+                uint64_t dn = n < 256 ? n : 256;
+                const uint8_t *sb = dn ? vk_usnap_bytes(u->addr, dn) : NULL;
+                const float *f = (const float *)(sb ? sb : (const uint8_t *)(uintptr_t)u->addr);
+                for (uint64_t k = 0; k < 16 && (k + 1) * 16 <= dn; k++)
                     sp(b, "%s[%llu] %g %g %g %g", k % 4 ? " " : "\n      ", (unsigned long long)k, f[4 * k], f[4 * k + 1],
                        f[4 * k + 2], f[4 * k + 3]);
+                // TOTK_DUMP_UBO_VEC=<slot>:<vec4>[,...]: those vec4 too (past the first 16), from guest memory
+                for (int k = 0; k < n_ubo_vec; k++) {
+                    uint64_t off = (uint64_t)ubo_vec[k].vec * 16;
+                    if (ubo_vec[k].slot != r->slot || off + 16 > n) continue;
+                    const float *g = (const float *)(uintptr_t)(u->addr + off);
+                    sp(b, "\n      c%d[%u] %g %g %g %g", r->slot, ubo_vec[k].vec, g[0], g[1], g[2], g[3]);
+                }
             } else {
                 sp(b, " (not mapped)");
             }
@@ -601,19 +637,36 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
         int st = nvn_stage(bd->stage), img = bd->kind == GFX_RES_IMG;
         char dt[24], fn[16];
         if (bd->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || bd->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
-            sp(b, "    %s %s slot %d: buffer texture (zero view bound)\n", stn[st], img ? "img" : "tex", r->slot);
+            for (uint32_t k = 0; k < (bd->count ? bd->count : 1u); k++) {
+                int slot = r->slot + (int)k;
+                uint64_t h = (!k && vk_exec_ubo_handle_res(r)) ? vk_exec_ubo_handle(ex, st, r) : handle_of(ex, st, slot, img);
+                uint64_t baddr = 0, bsz = 0;
+                VkFormat bfmt = VK_FORMAT_UNDEFINED;
+                uint32_t bbpb = 0;
+                vk_texture_lock();
+                int ok = h ? vk_texture_buffer_desc_locked(&ex->tex_pool, NVN_HANDLE_TEX(h), &baddr, &bsz, &bfmt, &bbpb, img) : 0;
+                vk_texture_unlock();
+                if (!ok) {
+                    sp(b, "    %s %s slot %d: unresolved texelbuf handle %#llx (dummy)\n", stn[st], img ? "img" : "tex", slot,
+                       (unsigned long long)h);
+                } else {
+                    sp(b, "    %s %s slot %d: tex %d texelbuf %s(%d) addr %#llx size %llu bpb %u\n", stn[st], img ? "img" : "tex",
+                       slot, NVN_HANDLE_TEX(h), fmt_name(bfmt, fn), (int)bfmt, (unsigned long long)baddr,
+                       (unsigned long long)bsz, (unsigned)bbpb);
+                }
+            }
             continue;
         }
         for (uint32_t k = 0; k < (bd->count ? bd->count : 1u); k++) {
             int slot = r->slot + (int)k;
-            uint64_t h = handle_of(ex, st, slot, img);
+            uint64_t h = (!k && vk_exec_ubo_handle_res(r)) ? vk_exec_ubo_handle(ex, st, r) : handle_of(ex, st, slot, img);
             sp(b, "    %s %s slot %d decl %s%s: ", stn[st], img ? "img" : "tex", slot, decl_type(r->type, dt),
                img && (r->flags & 4) ? " store" : "");
             if (!h) { sp(b, "no handle (dummy)\n"); continue; }
             view_t v;
             int hv = 0;
             const VkTexImage *t = vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(h), &v, &hv);
-            if (!t) { sp(b, "tex %d unresolved (dummy)\n", NVN_HANDLE_TEX(h)); continue; }
+            if (!t) { sp(b, "tex %d (handle %#llx) unresolved (dummy)\n", NVN_HANDLE_TEX(h), (unsigned long long)h); continue; }
             static const char *vt[] = {"1D", "2D", "3D", "cube", "1DArray", "2DArray", "cubeArray"};
             sp(b, "tex %d %s(%d) %ux%ux%u levels %u layers %u image %s", NVN_HANDLE_TEX(h), fmt_name(t->format, fn),
                (int)t->format, t->width, t->height, t->depth, t->levels, t->layers,
@@ -903,6 +956,15 @@ void vk_dump_init(void) {
     skip_runs = sr && *sr && *sr != '0';
     const char *du = cfg_get("TOTK_DUMP_UBO");
     dump_ubo = du && *du && *du != '0';
+    const char *uv = cfg_get("TOTK_DUMP_UBO_VEC");
+    for (const char *q = uv; q && *q && n_ubo_vec < 16;) {
+        int slot = 0;
+        unsigned vec = 0;
+        if (sscanf(q, "%d:%u", &slot, &vec) == 2) ubo_vec[n_ubo_vec].slot = slot, ubo_vec[n_ubo_vec++].vec = vec;
+        q = strchr(q, ',');
+        if (q) q++;
+    }
+    if (n_ubo_vec) dump_ubo = 1;
     const char *wt = cfg_get("TOTK_DUMP_TEX");
     for (char *q = (char *)wt; q && *q && nwant_tex < 16; q += *q == ',') {
         uint32_t *w = want_tex[nwant_tex++];
@@ -919,6 +981,14 @@ void vk_dump_init(void) {
     images_f = fopen(path, "w");
     if (!passes_f || !images_f) rt_fatal("vk_dump: cannot write to %s", dir);
     const char *bf = cfg_get("TOTK_DUMP_BUF");
+    if (bf && !strncmp(bf, "ubo:", 4)) {
+        char *q;
+        bd_ubo_slot = (int)strtol(bf + 4, &q, 0);
+        if (*q == ':') bd_ubo_off = strtoull(q + 1, &q, 0);
+        if (*q == ':') bd_ubo_size = strtoull(q + 1, &q, 0);
+        if (!bd_ubo_size) bd_ubo_size = 4096;
+        bf = NULL;
+    }
     if (bf && *bf) {
         char *q;
         bd_addr = strtoull(bf, &q, 0);

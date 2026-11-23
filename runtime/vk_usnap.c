@@ -36,6 +36,7 @@ typedef struct Arena {
     VkBuffer buf;
     VmaAllocation alloc;
     uint8_t *map;
+    uint8_t *cpu;   // cached host RAM shadow of map so vk_usnap_bytes never does uncached PCIe BAR reads
     uint64_t size;
 } Arena;
 
@@ -48,6 +49,7 @@ struct VkUsnap {
     Arena *arena;
     Reg *reg;
     int nreg;
+    uint64_t done_at_take;
     uint64_t total, copy_ns, refused;
 };
 
@@ -62,6 +64,8 @@ static int usnap_mode(void) {
     return m - 1;
 }
 
+typedef struct { uint64_t addr, size; } BoundUbo;
+
 static struct {
     int on;                     // this submission has a snapshot
     uint64_t fence, gen;
@@ -73,6 +77,7 @@ static struct {
     Wrote *wr;                  // GPU writes of submissions not known to be complete
     int nwr, cwr;
     VkUsnap *pending;           // pre-taken snapshot handed to the next handle replay
+    BoundUbo last_ubo[6][18];   // inherited uniform bindings across submissions (sync path)
     // since the last summary
     uint64_t subs, regions, bytes, copy_ns, hits, drops, inflight, refused, off_subs;
 } U;
@@ -81,6 +86,7 @@ static struct {
     PlatMutex lock;
     Rng *col, *tmp;
     int ncol, ccol, ctmp;
+    BoundUbo last_ubo[6][18];   // inherited uniform bindings across submissions (async take path)
 } T = {.lock = PLAT_MUTEX_INIT};
 
 static Arena *free_arenas;
@@ -122,6 +128,8 @@ static Arena *arena_get(uint64_t need) {
         return NULL;
     }
     a->map = info.pMappedData;
+    a->cpu = malloc(a->size);
+    if (!a->cpu) rt_fatal("vk_usnap: out of memory");
     rt_log("vk_usnap: new arena of %.1f MiB", a->size / 1048576.0);
     return a;
 }
@@ -133,7 +141,14 @@ static void arena_done(void *arg) {   // completion thread: the GPU has read it
     plat_mutex_unlock(&free_lock);
 }
 
-static void collect(Rng **col, int *ncol, int *ccol, const op_hdr *h, int depth) {
+static void col_push(Rng **col, int *ncol, int *ccol, uint64_t addr, uint64_t size) {
+    if (!addr || !size) return;
+    if (*ncol == *ccol) *col = grow(*col, ccol, sizeof **col);
+    uint64_t n = size < MAX_RANGE ? size : MAX_RANGE;
+    (*col)[(*ncol)++] = (Rng){addr & ~(uint64_t)(ALIGN - 1), addr + n};
+}
+
+static void collect(Rng **col, int *ncol, int *ccol, BoundUbo last_ubo[6][18], const op_hdr *h, int depth) {
     for (;;) {
         if (h->size < sizeof *h || (h->size & 7) || h->op >= OP_COUNT_)
             rt_fatal("vk_usnap: corrupt command record at %p: op %u size %u", (const void *)h, h->op, h->size);
@@ -143,17 +158,34 @@ static void collect(Rng **col, int *ncol, int *ccol, const op_hdr *h, int depth)
             h = (const op_hdr *)(uintptr_t)((const p_jump *)a)->target;
             continue;
         }
-        if (h->op == OP_CALL && depth < CALL_DEPTH) collect(col, ncol, ccol, nvn_op_first(((const p_jump *)a)->target), depth + 1);
+        if (h->op == OP_CALL && depth < CALL_DEPTH)
+            collect(col, ncol, ccol, last_ubo, nvn_op_first(((const p_jump *)a)->target), depth + 1);
         if (h->op == OP_BIND_UBO) {
             const p_bind_buf *b = a;
-            if (b->addr && b->size) {
-                if (*ncol == *ccol) *col = grow(*col, ccol, sizeof **col);
-                uint64_t n = b->size < MAX_RANGE ? b->size : MAX_RANGE;
-                (*col)[(*ncol)++] = (Rng){b->addr & ~(uint64_t)(ALIGN - 1), b->addr + n};
-            }
+            if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 18)
+                last_ubo[b->stage][b->index] = (BoundUbo){b->addr, b->size};
+            col_push(col, ncol, ccol, b->addr, b->size);
         }
         h = nvn_op_next(h);
     }
+}
+
+static void seed_inherited(Rng **col, int *ncol, int *ccol, BoundUbo last_ubo[6][18]) {
+    for (int st = 0; st < 6; st++)
+        for (int sl = 0; sl < 18; sl++) {
+            uint64_t addr = last_ubo[st][sl].addr, size = last_ubo[st][sl].size;
+            if (!addr || !size) continue;
+            uint64_t lo = addr & ~(uint64_t)(ALIGN - 1);
+            uint64_t n = size < MAX_RANGE ? size : MAX_RANGE;
+            uint64_t hi = addr + n;
+            VkMemSpan sp;
+            if (!vk_mem_resolve(lo, hi - lo, &sp) || sp.alloc || !sp.pool || sp.avail < hi - lo ||
+                (sp.cls != VK_MCLS_HOST_CACHED && sp.cls != VK_MCLS_HOST_UNC)) {
+                last_ubo[st][sl] = (BoundUbo){0, 0};
+                continue;
+            }
+            col_push(col, ncol, ccol, addr, size);
+        }
 }
 
 static int by_lo(const void *a, const void *b) {
@@ -200,10 +232,11 @@ static void sort_col(Rng *col, int n, int ccol, Rng **ptmp, int *pctmp) {
     if (src != col) memcpy(col, src, (size_t)n * sizeof *src);   // three passes end in tmp
 }
 
-// Keeps the GPU writes of submissions that are not done, merged into disjoint ranges sorted by lo (the terrain rewrites
-// one block before every draw: hundreds of equal entries), each with the newest fence among its parts.
-static void wr_prune(void) {
-    uint64_t done = vk_sync_fence_done();
+// Keeps the GPU writes of submissions not yet completed by `done`, merged into disjoint ranges sorted by lo (the
+// terrain rewrites one block before every draw: hundreds of equal entries), each with the newest fence among its parts.
+// For asynchronous pre-taken snapshots, `done` is the completed fence when vk_usnap_take copied guest memory: a GPU
+// write that finished after the copy is still newer than the snapshot's bytes and must drop the stale range.
+static void wr_prune(uint64_t done) {
     int n = 0;
     for (int i = 0; i < U.nwr; i++)
         if (U.wr[i].fence > done) U.wr[n++] = U.wr[i];
@@ -251,8 +284,9 @@ VkUsnap *vk_usnap_take(const uint64_t *handles, int n) {
     uint64_t t0 = kern_now_ns();
     plat_mutex_lock(&T.lock);
     T.ncol = 0;
+    seed_inherited(&T.col, &T.ncol, &T.ccol, T.last_ubo);
     for (int i = 0; i < n; i++)
-        if (handles[i]) collect(&T.col, &T.ncol, &T.ccol, nvn_op_first(handles[i]), 0);
+        if (handles[i]) collect(&T.col, &T.ncol, &T.ccol, T.last_ubo, nvn_op_first(handles[i]), 0);
     sort_col(T.col, T.ncol, T.ccol, &T.tmp, &T.ctmp);
     int creg = 0;
     uint64_t total = 0;
@@ -270,10 +304,15 @@ VkUsnap *vk_usnap_take(const uint64_t *handles, int n) {
         s->reg[s->nreg++] = (Reg){lo, hi, total, 0};
         total += (hi - lo + ALIGN - 1) & ~(uint64_t)(ALIGN - 1);
     }
+    s->done_at_take = vk_sync_fence_done();
     plat_mutex_unlock(&T.lock);
     if (s->nreg && (s->arena = arena_get(total))) {
-        for (int i = 0; i < s->nreg; i++)
-            memcpy(s->arena->map + s->reg[i].off, (const void *)(uintptr_t)s->reg[i].lo, s->reg[i].hi - s->reg[i].lo);
+        for (int i = 0; i < s->nreg; i++) {
+            size_t len = (size_t)(s->reg[i].hi - s->reg[i].lo);
+            uint8_t *cpu = s->arena->cpu + s->reg[i].off;
+            memcpy(cpu, (const void *)(uintptr_t)s->reg[i].lo, len);
+            memcpy(s->arena->map + s->reg[i].off, cpu, len);
+        }
         vmaFlushAllocation(vk_ctx()->vma, s->arena->alloc, 0, total);
         s->total = total;
         s->copy_ns = kern_now_ns() - t0;
@@ -313,7 +352,7 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
             vk_usnap_discard(s);
             return;
         }
-        wr_prune();
+        wr_prune(s->done_at_take);
         while (U.creg < s->nreg) U.reg = grow(U.reg, &U.creg, sizeof *U.reg);
         memcpy(U.reg, s->reg, (size_t)s->nreg * sizeof *U.reg);
         U.nreg = s->nreg;
@@ -332,10 +371,11 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     }
     uint64_t t0 = kern_now_ns();
     U.ncol = 0;
+    seed_inherited(&U.col, &U.ncol, &U.ccol, U.last_ubo);
     for (int i = 0; i < n; i++)
-        if (handles[i]) collect(&U.col, &U.ncol, &U.ccol, nvn_op_first(handles[i]), 0);
+        if (handles[i]) collect(&U.col, &U.ncol, &U.ccol, U.last_ubo, nvn_op_first(handles[i]), 0);
     sort_col(U.col, U.ncol, U.ccol, &U.tmp, &U.ctmp);
-    wr_prune();
+    wr_prune(vk_sync_fence_done());
     // merge, keeping only what lies wholly in one imported pool and no GPU write in flight touches
     U.nreg = 0;
     uint64_t total = 0;
@@ -359,8 +399,12 @@ void vk_usnap_begin(const uint64_t *handles, int n, uint64_t fence) {
     }
     if (!U.nreg) return;
     if (!(U.arena = arena_get(total))) return;
-    for (int i = 0; i < U.nreg; i++)
-        memcpy(U.arena->map + U.reg[i].off, (const void *)(uintptr_t)U.reg[i].lo, U.reg[i].hi - U.reg[i].lo);
+    for (int i = 0; i < U.nreg; i++) {
+        size_t len = (size_t)(U.reg[i].hi - U.reg[i].lo);
+        uint8_t *cpu = U.arena->cpu + U.reg[i].off;
+        memcpy(cpu, (const void *)(uintptr_t)U.reg[i].lo, len);
+        memcpy(U.arena->map + U.reg[i].off, cpu, len);
+    }
     vmaFlushAllocation(vk_ctx()->vma, U.arena->alloc, 0, total);   // a no-op on coherent memory
     U.on = 1;
     U.subs++, U.regions += (uint64_t)U.nreg, U.bytes += total, U.copy_ns += kern_now_ns() - t0;
@@ -401,7 +445,7 @@ const uint8_t *vk_usnap_bytes(uint64_t addr, uint64_t n) {
     if (i >= U.nreg) return NULL;
     const Reg *r = &U.reg[i];
     if (r->dropped || addr < r->lo || addr + n > r->hi) return NULL;
-    return U.arena->map + r->off + (addr - r->lo);
+    return (U.arena->cpu ? U.arena->cpu : U.arena->map) + r->off + (addr - r->lo);
 }
 
 void vk_usnap_drop(uint64_t addr, uint64_t n) {
@@ -419,8 +463,12 @@ uint64_t vk_usnap_gen(void) { return U.gen; }
 // The arenas back on the free list (vk_exec_draw_shutdown: the device is idle, every completion ran).
 void vk_usnap_shutdown(void) {
     if (U.pending) vk_usnap_discard(U.pending), U.pending = NULL;
+    memset(U.last_ubo, 0, sizeof U.last_ubo);
+    plat_mutex_lock(&T.lock);
+    memset(T.last_ubo, 0, sizeof T.last_ubo);
+    plat_mutex_unlock(&T.lock);
     plat_mutex_lock(&free_lock);
-    for (Arena *a = free_arenas, *next; a; a = next) next = a->next, vmaDestroyBuffer(vk_ctx()->vma, a->buf, a->alloc), free(a);
+    for (Arena *a = free_arenas, *next; a; a = next) next = a->next, vmaDestroyBuffer(vk_ctx()->vma, a->buf, a->alloc), free(a->cpu), free(a);
     free_arenas = NULL;
     plat_mutex_unlock(&free_lock);
 }

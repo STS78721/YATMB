@@ -13,6 +13,7 @@
 
 #include "cfg.h"
 #include "flight.h"
+#include "game_profile.h"
 #include "gfx.h"
 #include "host.h"
 #include "input.h"
@@ -268,8 +269,8 @@ static void dump_main(void *arg) {
         free(have), free(j);
         return;
     }
-    fprintf(f, "# totk flight dump: %s at frame %llu, interval %.1f ms\n", j->why, (unsigned long long)j->trig_frame,
-            j->trig_interval_us / 1000.0);
+    fprintf(f, "# %s flight dump: %s at frame %llu, interval %.1f ms\n", game_profile()->short_name, j->why,
+            (unsigned long long)j->trig_frame, j->trig_interval_us / 1000.0);
     fprintf(f, "frame\tt_ms\tinterval_ms");
     for (int k = 0; k < PERF_N; k++) fprintf(f, "\t%s", blocked_names[k]);
     for (int k = 0; k < C_N; k++) fprintf(f, "\t%s", count_names[k]);

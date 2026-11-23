@@ -89,6 +89,11 @@ typedef struct VkExec {
     // ---- vk_exec_draw.c slots (draws, binds, dispatch): left empty by vk_exec.c
     const prog_t *prog;                  // OP_BIND_PROGRAM
     int32_t prog_stages;
+    const prog_t *stage_prog[6];         // OP_BIND_PROGRAM per NVN stage bit (VS FS GS TCS TES CS): a program is
+    int32_t stage_mask[6];               // bound for the stages in its mask only (vk_exec_draw.c bound_program)
+    const prog_t *cprog;                 // the compute binding, which a dispatch swaps into prog
+    uint8_t prog_dirty;                  // a graphics stage was bound since prog was resolved (resolve_program)
+    int32_t cprog_stages;
     NVNbufferRange vbuf[16];             // OP_BIND_VBUF
     p_bind_buf ubo[6][18], ssbo[6][16];  // OP_BIND_UBO / OP_BIND_SSBO per stage and index
     uint64_t tex[6][128], samp[6][128], img[6][32];   // OP_BIND_TEX / OP_BIND_SAMP / OP_BIND_IMG handles per stage
@@ -191,6 +196,9 @@ void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16],
 // vk_exec_draw.c: OP_DRAW, OP_DRAW_IDX, OP_DISPATCH, OP_BIND_* (program, state, vattr, vstream, vbuf, ubo, ssbo, tex,
 // samp, img), OP_UPDATE_UB, OP_DRAW_IDX_IND, OP_DRAW_IDX_IND_COUNT, OP_DISPATCH_IND. payload: nvn_op_payload of the record.
 void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload);
+int vk_exec_ubo_handle_res(const GfxShaderRes *r);
+uint64_t vk_exec_ubo_handle(const VkExec *ex, int st, const GfxShaderRes *r);
+uint64_t vk_exec_ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r);
 // The aspect a sampled view of img reads (vk_exec_draw.c get_view): stencil for a view in STENCIL depth-stencil mode.
 VkImageAspectFlags vk_exec_view_aspect(const VkTexImage *img, const view_t *v, int hv);
 VkImageView vk_exec_target_view(const VkTexImage *img, VkFormat format, VkImageViewType type, uint32_t aspect,

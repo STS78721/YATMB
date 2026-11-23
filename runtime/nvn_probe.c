@@ -38,9 +38,9 @@ static const ProcRow procs[] = {
 };
 #define NPROCS ((int)(sizeof procs / sizeof *procs))
 
-// The named fatal stubs checked in child processes: proc names that no task implements (NvRm interop of the NVX
-// extension), so the check does not go stale when the stub list shrinks.
-static const char *const fatal_procs[] = {"nvnSyncGetNvRmSyncNVX", "nvnTextureGetNvRmSurfaceNVX"};
+// The named fatal stubs checked in child processes: proc names that no task implements (unimplemented NvRm surface
+// interop of the NVX extension), so the check does not go stale when the stub list shrinks.
+static const char *const fatal_procs[] = {"nvnTextureGetNvRmSurfaceNVX"};
 #define NFATAL ((int)(sizeof fatal_procs / sizeof *fatal_procs))
 
 static int failures, checks, n_objects, n_ops, n_effects;
@@ -340,6 +340,16 @@ static void probe_sync_events(void) {
     sf->fence = nvn_fence_last() + 100;
     CHECK(CALL(nvnSyncWait, U(&sync_future), 1000000) == NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED,
           "a fence value that was never submitted is never reached");
+    uint8_t nvrm[64] = {0};
+    CHECK((uint8_t)CALL(nvnSyncGetNvRmSyncNVX, U(&sync_future), U(nvrm)) == 1 && *(uint32_t *)(nvrm + 0x08) == 1 &&
+              *(uint32_t *)(nvrm + 0x0c) == 1 && *(uint32_t *)(nvrm + 0x10) == 1,
+          "SyncGetNvRmSyncNVX encodes inline NvRmSync");
+    OBJ(NVNsync, sync_nvrm);
+    CHECK((uint8_t)CALL(nvnSyncInitializeFromNvRmSyncNVX, U(&sync_nvrm), U(&dev), U(nvrm)) == 1 &&
+              ((const sync_t *)(const void *)&sync_nvrm)->fenced == 1 &&
+              ((const sync_t *)(const void *)&sync_nvrm)->fence == sf->fence,
+          "SyncInitializeFromNvRmSyncNVX round-trips fence");
+    CALL(nvnSyncFinalize, U(&sync_nvrm));
     CALL(nvnSyncFinalize, U(&sync_future));
     CHECK(sf->magic == 0, "SyncFinalize");
 

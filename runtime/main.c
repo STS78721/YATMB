@@ -236,7 +236,8 @@ static void crash_handler(const PlatCrash *x) {
     if (plat_xchg32(&busy, 1)) plat_exit(71);
     char d[160];
     uintptr_t rip = x->rip;
-    rt_logf("FATAL: %s (%#x) at host %p (totk+%#llx)", x->what, x->code, (void *)rip, (unsigned long long)x->offset);
+    const char *sn = game_profile()->short_name;
+    rt_logf("FATAL: %s (%#x) at host %p (%s+%#llx)", x->what, x->code, (void *)rip, sn, (unsigned long long)x->offset);
     if (x->access >= 0)
         rt_logf(", %s address %#llx", x->access == 1 ? "writing" : x->access == 8 ? "executing" : "reading",
                 (unsigned long long)x->addr);
@@ -245,7 +246,7 @@ static void crash_handler(const PlatCrash *x) {
     if (f) rt_logf("  in lifted function f_%llx = %s\n", (unsigned long long)f, ldr_describe(f, d, sizeof d));
     for (int i = 0; i < x->nframes; i++) {   // abort and invalid parameter: where the host code called it
         uint64_t g = lifted_function(x->frames[i]);
-        rt_logf("  host frame %2d: totk+%#llx", i, (unsigned long long)(x->frames[i] - (rip - x->offset)));
+        rt_logf("  host frame %2d: %s+%#llx", i, sn, (unsigned long long)(x->frames[i] - (rip - x->offset)));
         if (g) rt_logf(" in lifted function f_%llx", (unsigned long long)g);
         rt_log_raw("\n", 1);
     }
@@ -261,6 +262,22 @@ static void crash_handler(const PlatCrash *x) {
             rt_logf("  guest frame %2d: %s\n", n, ldr_describe(lr, d, sizeof d));
             if (next <= fp || next - fp > (64u << 20)) break;
             fp = next;
+        }
+        // NS2_CRASH_PEEK=where[*count],...: guest words to print with the crash, for finding where a bad pointer came
+        // from. where is an address, or xN / tlr (the thread's TLR) with an optional +offset; count is in words.
+        const char *peek = cfg_get("NS2_CRASH_PEEK");
+        for (const char *p = peek; p && *p;) {
+            char *end;
+            uint64_t a;
+            if (*p == 'x') a = c->x[strtoul(p + 1, &end, 10) % 31];
+            else if (!strncmp(p, "tlr", 3)) a = c->tpidrro, end = (char *)p + 3;
+            else a = strtoull(p, &end, 0);
+            if (*end == '+') a += strtoull(end + 1, &end, 0);
+            unsigned long n = *end == '*' ? strtoul(end + 1, &end, 0) : 1;
+            for (unsigned long k = 0; k < n && k < 64; k++, a += 8)
+                if (readable(a, 8)) rt_logf("  peek %016llx: %016llx\n", (unsigned long long)a, (unsigned long long)LD64(a));
+                else rt_logf("  peek %016llx: unreadable\n", (unsigned long long)a);
+            p = *end == ',' ? end + 1 : end + strlen(end);
         }
     } else {
         rt_logf("  not on a guest thread\n");

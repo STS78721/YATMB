@@ -5,7 +5,7 @@
 #include "imgui.h"
 
 namespace mkw_theme {
-enum { THEME_TENNIS = 0, THEME_LIGHT = 1, THEME_DARK = 2 };
+enum { THEME_TENNIS = 0, THEME_LIGHT = 1, THEME_DARK = 2, THEME_STORYBOOK = 3 };
 
 inline ImU32 kBackdrop, kPanel, kHeader, kSidebar, kDivider;
 inline ImU32 kText, kTextSoft, kTextDim, kTextOff;
@@ -14,7 +14,28 @@ inline ImU32 kRowSel, kRowHover, kWarn, kHelp;
 inline ImU32 kButtonHover, kButtonActive, kScroll;
 
 inline void apply(int theme) {
-    if (theme == THEME_LIGHT) {
+    if (theme == THEME_STORYBOOK) {
+        // Storybook Meadow: sunlit deep forest emerald, warm cream parchment text, vibrant leaf-green & golden star accents
+        kBackdrop = IM_COL32(8, 20, 12, 176);
+        kPanel = IM_COL32(22, 46, 30, 255);
+        kHeader = IM_COL32(16, 35, 22, 255);
+        kSidebar = IM_COL32(18, 40, 26, 255);
+        kDivider = IM_COL32(68, 118, 76, 255);
+        kText = IM_COL32(252, 249, 238, 255);
+        kTextSoft = IM_COL32(206, 228, 198, 255);
+        kTextDim = IM_COL32(150, 182, 148, 255);
+        kTextOff = IM_COL32(96, 124, 98, 255);
+        kAccent = IM_COL32(96, 226, 68, 255);
+        kAccentSoft = IM_COL32(96, 226, 68, 84);
+        kAccentText = IM_COL32(255, 224, 96, 255);
+        kRowSel = IM_COL32(34, 68, 43, 255);
+        kRowHover = IM_COL32(28, 56, 36, 220);
+        kWarn = IM_COL32(255, 148, 86, 255);
+        kHelp = IM_COL32(15, 33, 21, 255);
+        kButtonHover = IM_COL32(44, 88, 54, 255);
+        kButtonActive = IM_COL32(58, 114, 68, 255);
+        kScroll = IM_COL32(86, 138, 92, 255);
+    } else if (theme == THEME_LIGHT) {
         kBackdrop = IM_COL32(0, 0, 0, 150);
         kPanel = IM_COL32(240, 240, 242, 255);
         kHeader = IM_COL32(250, 250, 251, 255);

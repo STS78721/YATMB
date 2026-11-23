@@ -65,6 +65,18 @@ NVN_API(nvnDeviceGetTimestampInNanoseconds) { ret_x(c, ticks_to_ns(((const NVNco
 // ---------- memory pools and buffers
 // size_t nvnMemoryPoolGetSize(const NVNmemoryPool *p)
 NVN_API(nvnMemoryPoolGetSize) { ret_x(c, ((const pool_t *)arg_p(c, 0))->size); }
+NVN_API(nvnMemoryPoolBuilderGetDevice) { ret_x(c, (uintptr_t)((const pool_builder_t *)arg_p(c, 0))->dev); }
+NVN_API(nvnMemoryPoolBuilderGetMemory) { ret_x(c, (uintptr_t)((const pool_builder_t *)arg_p(c, 0))->mem); }
+NVN_API(nvnMemoryPoolBuilderGetSize) { ret_x(c, ((const pool_builder_t *)arg_p(c, 0))->size); }
+NVN_API(nvnBufferBuilderGetDevice) { ret_x(c, (uintptr_t)((const buf_builder_t *)arg_p(c, 0))->dev); }
+NVN_API(nvnBufferBuilderGetMemoryPool) { ret_x(c, (uintptr_t)((const buf_builder_t *)arg_p(c, 0))->pool); }
+NVN_API(nvnBufferBuilderGetMemoryOffset) { ret_x(c, (uint64_t)((const buf_builder_t *)arg_p(c, 0))->off); }
+NVN_API(nvnBufferBuilderGetSize) { ret_x(c, ((const buf_builder_t *)arg_p(c, 0))->size); }
+NVN_API(nvnQueueBuilderGetDevice) { ret_x(c, (uintptr_t)((const queue_builder_t *)arg_p(c, 0))->dev); }
+NVN_API(nvnQueueBuilderGetMemory) { ret_x(c, (uintptr_t)((const queue_builder_t *)arg_p(c, 0))->mem); }
+NVN_API(nvnQueueBuilderGetMemorySize) { ret_x(c, ((const queue_builder_t *)arg_p(c, 0))->mem_sz); }
+NVN_API(nvnEventBuilderGetMemoryPool) { ret_x(c, (uintptr_t)((const ev_builder_t *)arg_p(c, 0))->pool); }
+NVN_API(nvnEventBuilderGetMemoryOffset) { ret_x(c, (uint64_t)((const ev_builder_t *)arg_p(c, 0))->off); }
 // void nvnMemoryPoolInvalidateMappedRange(const NVNmemoryPool *p, ptrdiff_t offset, size_t size)
 NVN_API(nvnMemoryPoolInvalidateMappedRange) {
     int64_t off = (int64_t)arg_x(c, 1);

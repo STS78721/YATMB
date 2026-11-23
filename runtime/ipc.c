@@ -69,6 +69,7 @@ static void fsp_srv_handler(IpcSession *s, const IpcRequest *rq, IpcResponse *rs
 // Services sm: hands out. Anything else is a named fatal.
 static const struct { const char *name; IpcHandler handler; } services[] = {
     {"audren:u", audren_manager_handler},
+    {"audout:u", audout_manager_handler},
     {"aud:u", aud_user_handler},   // Switch 2: the way the SDK reaches audren:u
     {"fsp-srv", fsp_srv_handler},
 };

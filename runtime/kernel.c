@@ -116,6 +116,9 @@ _Static_assert(offsetof(RtThread, host_depth) == sizeof(int), "host.h kern_host_
 static RtThread *g_all, *g_wait, *g_main;
 static uint64_t g_next_id = 0x51, g_wseq, g_created;
 static uint64_t g_main_stack;
+static uint64_t g_main_stack_size = MAIN_STACK;
+static int g_main_prio = MAIN_PRIO;
+static int g_main_core = MAIN_CORE;
 
 static void lock(void) { plat_mutex_lock(&G); }
 static void unlock(void) { plat_mutex_unlock(&G); }
@@ -1011,8 +1014,7 @@ int kern_core_away(void) {
     lock();
     core_put(t);
     acct(t, S_HOST);
-    if (rt_trace & RT_TRACE_SCHED)   // the caller as an exe RVA (totk.map)
-        t->wobj = (uintptr_t)__builtin_return_address(0) - plat_exe_base();
+    t->wobj = (uintptr_t)__builtin_return_address(0) - plat_exe_base();
     unlock();
     return 1;
 }
@@ -1484,6 +1486,17 @@ uint64_t kern_threads_created(void) {
 
 Cpu *kern_cpu(void) { return tcur ? tcur->cur : NULL; }
 
+void kern_configure_main(int prio, int core, uint64_t stack_size) {
+    if (g_main) rt_fatal("kernel: kern_configure_main called after main thread creation");
+    if (prio < 0 || prio >= 64) rt_fatal("kernel: invalid main thread priority %d", prio);
+    if (core < 0 || core >= NCORE) rt_fatal("kernel: invalid main thread core %d", core);
+    if (stack_size < 0x1000 || (stack_size & 0xFFF) || stack_size > (16ull << 20))
+        rt_fatal("kernel: invalid main thread stack size %#llx", (unsigned long long)stack_size);
+    g_main_prio = prio;
+    g_main_core = core;
+    g_main_stack_size = stack_size;
+}
+
 uint32_t kern_main_thread(Cpu **cpu) {
     if (tcur) {
         if (!tcur->is_main) rt_fatal("kern_main_thread on guest thread %#x, not the main thread", tcur->handle);
@@ -1492,13 +1505,13 @@ uint32_t kern_main_thread(Cpu **cpu) {
     }
     if (g_main) rt_fatal("kern_main_thread: the main thread already runs on another host thread");
     const RtGuestLayout *L = mem_layout();
-    uint64_t stack = L->stack.base + L->stack.size - MAIN_STACK;
-    if (!plat_mem_commit(stack, MAIN_STACK))
+    uint64_t stack = L->stack.base + L->stack.size - g_main_stack_size;
+    if (!plat_mem_commit(stack, g_main_stack_size))
         rt_fatal("kernel: commit the main thread stack at %#llx failed", (unsigned long long)stack);
-    RtThread *t = thr_new(MAIN_PRIO, MAIN_CORE, (1ull << NCORE) - 1);
+    RtThread *t = thr_new(g_main_prio, g_main_core, (1ull << NCORE) - 1);
     t->started = 1;
     t->is_main = 1;
-    t->stack_top = stack + MAIN_STACK;
+    t->stack_top = stack + g_main_stack_size;
     t->cpu->sp = t->stack_top;
     t->tid = plat_thread_id();
     perf_main_thread();
@@ -1518,7 +1531,7 @@ uint32_t kern_main_thread(Cpu **cpu) {
 void kern_main_stack(uint64_t *base, uint64_t *size) {
     uint64_t b = __atomic_load_n(&g_main_stack, __ATOMIC_ACQUIRE);
     *base = b;
-    *size = b ? MAIN_STACK : 0;
+    *size = b ? g_main_stack_size : 0;
 }
 
 static void guest_main(void *p) {
@@ -2336,6 +2349,57 @@ void kern_fiber_switch(Cpu *c) {
 void kern_fiber_current(Cpu *c) {
     RtThread *t = tcur;
     c->x[0] = t && t->fiber ? t->fiber->addr : 0;
+}
+
+void kern_dump_threads(void) {
+    struct Snap {
+        uint32_t handle, tid, waker;
+        int prio, cur_core, core, host_depth, wkind, is_main, is_render, is_self;
+        uint64_t waddr, wkey, wobj, entry;
+        const Cpu *cur;
+    } snap[64];
+    int n = 0;
+    lock();
+    for (RtThread *t = g_all; t && n < 64; t = t->all) {
+        if (t->exited) continue;
+        snap[n++] = (struct Snap){
+            .handle = t->handle,
+            .tid = t->tid,
+            .waker = t->waker,
+            .prio = t->prio,
+            .cur_core = t->cur_core,
+            .core = t->core,
+            .host_depth = t->host_depth,
+            .wkind = t->wkind,
+            .is_main = t->is_main,
+            .is_render = (t == g_render),
+            .is_self = (t == tcur),
+            .waddr = t->waddr,
+            .wkey = t->wkey,
+            .wobj = t->wobj,
+            .entry = t->entry,
+            .cur = t->cur,
+        };
+    }
+    unlock();
+    rt_log("kern: live threads (%d):", n);
+    for (int i = 0; i < n; i++) {
+        const struct Snap *s = &snap[i];
+        char ent[160], dpc[160], dlr[160];
+        rt_log("kern: thr %#x prio=%d core=%d/%d host_depth=%d wkind=%d waddr=%#llx wkey=%#llx wobj=%#llx "
+               "waker=%#x main=%d render=%d self=%d tid=%u entry=%s",
+               s->handle, s->prio, s->cur_core, s->core, s->host_depth, s->wkind, (unsigned long long)s->waddr,
+               (unsigned long long)s->wkey, (unsigned long long)s->wobj, s->waker, s->is_main, s->is_render,
+               s->is_self, s->tid, ldr_describe(s->entry, ent, sizeof ent));
+        if (!s->is_self && s->cur) {
+            if (s->cur_core < 0 || s->wkind != W_NONE || s->host_depth > 0) {
+                kern_backtrace(s->cur);
+            } else {
+                rt_log("  running pc %s lr %s", ldr_describe(s->cur->pc, dpc, sizeof dpc),
+                       ldr_describe(s->cur->x[30], dlr, sizeof dlr));
+            }
+        }
+    }
 }
 
 HOST_OVERRIDE(KERN_SYM_INITIALIZE_FIBER, kern_fiber_initialize);

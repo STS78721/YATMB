@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "game_profile.h"
 #include "host.h"
 #include "layout.h"
 #include "platform/platform.h"
@@ -329,11 +330,22 @@ static void mark_used(int observers, const char *name) {
 
 // Order (MNG loader.c:216-224): observer (JUMP_SLOT only), override by name, own definition, other modules in load
 // order, weak -> 0, strong -> named fatal stub. Overrides also replace a module's own symbols.
+//
+// The console's rtld does not prefer the module's own definition: it binds a default-visibility symbol to the first
+// module in load order (main, subsdk0..9, sdk) that defines it, and only a hidden or protected one to the module's own.
+// So when the sdk and a subsdk both carry a library (nn::movie, say), both use the subsdk's copy of its singletons. With
+// own-first binding each half gets its own: the sdk half sets one up and the subsdk half reads the other, never set
+// up. Titles with GAME_QUIRK_RTLD_ORDER bind as rtld does; the rest keep own-first until each is boot-tested with it,
+// because it also moves the sdk's operator new / delete and typeinfo references to main's definitions.
+static int rtld_order = -1;
+
 static Res resolve(Mod *m, uint32_t si, int jump) {
     Res *cache = jump ? &m->res_jump[si] : &m->res_plain[si];
     if (cache->kind != RES_UNSET) return *cache;
     const char *name = sym_name(m, si);
-    uint64_t guest = sym_defined(m, si) ? m->pub.base + m->syms[si].value : find_symbol(name, NULL);
+    if (rtld_order < 0) rtld_order = game_profile_has(GAME_QUIRK_RTLD_ORDER);
+    int own = sym_defined(m, si) && (!rtld_order || (m->syms[si].other & 3) != 0);
+    uint64_t guest = own ? m->pub.base + m->syms[si].value : find_symbol(name, NULL);
     GuestFn f;
     Res r;
     if (jump && (f = hostfn_observer(name))) {

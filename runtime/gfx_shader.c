@@ -298,7 +298,7 @@ static void xlate_identity(void) {
         }
         if (!f || !hex32(f, xlate_id)) {
             uint8_t *exe = read_file(xlate_exe, &size);
-            how = exe ? "sha256 of the exe; tools/build_xlate.py writes totk_xlate.id" : "none: no translator";
+            how = exe ? "sha256 of the exe; tools/build_xlate.py writes ns2_xlate.id" : "none: no translator";
             if (exe) rt_sha256(exe, (size_t)size, xlate_id);
             free(exe);
         }
@@ -416,7 +416,7 @@ static void init_shadow_ref(void *arg) {
 static int child_start(Svc *v) {
     paths();
     if (!xlate_exe[0] || !file_exists(xlate_exe)) {
-        rt_log("gfx_shader: translator not found (%s); set DKB_XLATE", xlate_exe[0] ? xlate_exe : "<none>");
+        rt_log("gfx_shader: translator not found (%s); set NS2_XLATE", xlate_exe[0] ? xlate_exe : "<none>");
         return 0;
     }
     uint32_t err = 0;
@@ -944,8 +944,10 @@ static void add_res(GfxShader *s, int kind, const char *o, const char *e) {
     r->type = (uint16_t)json_int(o, e, "type", 0);
     r->format = (uint8_t)fmt_code(buf);
     r->flags = (uint8_t)json_int(o, e, "flags", 0);
-    r->cbuf_slot = (int8_t)json_int(o, e, "cbuf_slot", -1);
+    r->raw_cbuf = (int32_t)json_int(o, e, "cbuf_slot", -1);
+    r->cbuf_slot = (int8_t)r->raw_cbuf;
     int handle = (int)json_int(o, e, "handle", 0);
+    r->raw_handle = (uint32_t)handle;
     r->handle = (uint16_t)handle;
     r->count = (uint16_t)json_int(o, e, "array", 1);
     r->separate = sep && *sep == 't';
@@ -2008,9 +2010,17 @@ static uint32_t *spirv_int_io(const uint32_t *w, uint64_t n, uint32_t sc, uint32
     return out;
 }
 
-// Retype UniformConstant texture/storage image bindings (umask=uint, smask=sint, indexed by binding < 64) for CS.
-static uint32_t *spirv_int_images(const uint32_t *w, uint64_t n, uint64_t umask, uint64_t smask, uint64_t *out_n) {
-    if (!w || n < 5 || !(umask | smask)) return NULL;
+static int img_masks_any(const uint64_t u[GFX_IMG_MASK_WORDS], const uint64_t s[GFX_IMG_MASK_WORDS]) {
+    uint64_t m = 0;
+    for (int i = 0; i < GFX_IMG_MASK_WORDS; i++) m |= u[i] | s[i];
+    return m != 0;
+}
+
+// Retype UniformConstant texture/storage image bindings (umask=uint, smask=sint, indexed by binding < GFX_IMG_MASK_WORDS * 64).
+static uint32_t *spirv_int_images(const uint32_t *w, uint64_t n,
+                                  const uint64_t umask[GFX_IMG_MASK_WORDS],
+                                  const uint64_t smask[GFX_IMG_MASK_WORDS], uint64_t *out_n) {
+    if (!w || n < 5 || !img_masks_any(umask, smask)) return NULL;
     uint32_t bound = w[3];
     if (!bound || bound > (1u << 22)) return NULL;
     typedef struct { uint32_t w[10]; uint8_t len; } ImgDesc;
@@ -2059,9 +2069,11 @@ static uint32_t *spirv_int_images(const uint32_t *w, uint64_t n, uint64_t umask,
         else if (op == OP_DECORATE && len >= 4 && a[1] == 33u && a[0] < bound) bind_of[a[0]] = (int32_t)a[2];
         else if (op == OP_VARIABLE && len >= 4) {
             if (!var_at) var_at = i;
-            if (a[1] < bound && a[2] == 0 && bind_of[a[1]] >= 0 && bind_of[a[1]] < 64) {
+            if (a[1] < bound && a[2] == 0 && bind_of[a[1]] >= 0 && bind_of[a[1]] < GFX_IMG_MASK_WORDS * 64) {
                 int32_t b = bind_of[a[1]];
-                uint8_t k = ((umask >> b) & 1ull) ? 1 : ((smask >> b) & 1ull) ? 2 : 0;
+                uint64_t bit = 1ull << (b & 63);
+                int widx = b >> 6;
+                uint8_t k = (umask[widx] & bit) ? 1 : (smask[widx] & bit) ? 2 : 0;
                 uint32_t t = a[0] < bound ? ptr_pointee[a[0]] : 0;
                 if (t && arr_elem[t]) t = arr_elem[t];
                 uint32_t img_t = t && samp_of[t] ? samp_of[t] : t;
@@ -2107,7 +2119,7 @@ static uint32_t *spirv_int_images(const uint32_t *w, uint64_t n, uint64_t umask,
             }
             ImgDesc d = {0};
             memcpy(d.w, w + ia, (size_t)ilen * 4u);
-            if (ilen >= 5 && d.w[4] == 1u) {
+            if ((ilen >= 5 && d.w[4] == 1u) || (ilen >= 9 && d.w[8] != 0u)) {
                 var_kind[vid] = 0;
             } else {
                 d.w[2] = scalar;
@@ -2376,6 +2388,22 @@ static void variant_key(const uint8_t base[32], uint32_t tag, uint64_t umask, ui
     rt_sha256(buf, sizeof buf, out);
 }
 
+static void variant_key_img(const uint8_t base[32], uint32_t tag,
+                            const uint64_t umask[GFX_IMG_MASK_WORDS],
+                            const uint64_t smask[GFX_IMG_MASK_WORDS], uint8_t out[32]) {
+    if (!img_masks_any(umask, smask)) { memcpy(out, base, 32); return; }
+    uint64_t hi = 0;
+    for (int i = 1; i < GFX_IMG_MASK_WORDS; i++) hi |= umask[i] | smask[i];
+    if (!hi) { variant_key(base, tag, umask[0], smask[0], out); return; }
+    uint8_t buf[8 + 32 + 4 + 2 * GFX_IMG_MASK_WORDS * 8];
+    memcpy(buf, "NVN2VAR2", 8);
+    memcpy(buf + 8, base, 32);
+    memcpy(buf + 40, &tag, 4);
+    memcpy(buf + 44, umask, GFX_IMG_MASK_WORDS * 8);
+    memcpy(buf + 44 + GFX_IMG_MASK_WORDS * 8, smask, GFX_IMG_MASK_WORDS * 8);
+    rt_sha256(buf, sizeof buf, out);
+}
+
 static GfxShader *prepared_load(int stage, const uint8_t *control, const uint8_t *code, const uint8_t base[32],
                                 const uint8_t key[32], const GfxShaderAnswers *a) {
     char hex[65], spv_p[PATH_CAP + 80], res_p[PATH_CAP + 80];
@@ -2417,7 +2445,7 @@ static GfxShader *prepared_load(int stage, const uint8_t *control, const uint8_t
                                          umask, smask, &new_n);
         if (patched) { free(s->spirv); s->spirv = patched; s->words = new_n; }
     }
-    if (a && (a->img_uint | a->img_sint)) {
+    if (a && img_masks_any(a->img_uint, a->img_sint)) {
         uint64_t new_n = 0;
         uint32_t *patched = spirv_int_images(s->spirv, s->words, a->img_uint, a->img_sint, &new_n);
         if (patched) { free(s->spirv); s->spirv = patched; s->words = new_n; }
@@ -2459,19 +2487,21 @@ static const GfxShader *prepared_get(int stage, const uint8_t *control, const ui
             if (a->attr_type[i] == GFX_TYPE_UINT) umask |= 1ull << i;
             else if (a->attr_type[i] == GFX_TYPE_SINT) smask |= 1ull << i;
         }
+        variant_key(base, tag, umask, smask, key);
     } else if (a && stage == GFX_STAGE_FS) {
         tag = 2;
         for (int i = 0; i < 8; i++) {
             if (a->frag_out_type[i] == GFX_TYPE_UINT) umask |= 1ull << i;
             else if (a->frag_out_type[i] == GFX_TYPE_SINT) smask |= 1ull << i;
         }
+        variant_key(base, tag, umask, smask, key);
     } else if (a && stage == GFX_STAGE_CS) {
-        tag = 3;
-        umask = a->img_uint, smask = a->img_sint;
+        variant_key_img(base, 3, a->img_uint, a->img_sint, key);
+    } else {
+        memcpy(key, base, 32);
     }
-    variant_key(base, tag, umask, smask, key);
-    if (a && stage != GFX_STAGE_CS && (a->img_uint | a->img_sint))
-        variant_key(key, 3, a->img_uint, a->img_sint, key);
+    if (a && stage != GFX_STAGE_CS && img_masks_any(a->img_uint, a->img_sint))
+        variant_key_img(key, 3, a->img_uint, a->img_sint, key);
     GfxShader *s = mem_find(key);
     if (s) { plat_inc64(&n_hits); return s; }
     s = prepared_load(stage, control, code, base, key, a);
@@ -2481,6 +2511,59 @@ static const GfxShader *prepared_get(int stage, const uint8_t *control, const ui
         return fail("NVN 2 prepared shader missing from spirv/", hex), NULL;
     }
     plat_inc64(&n_hits);
+    return mem_insert(s);
+}
+
+const GfxShader *gfx_shader_with_int_images(const GfxShader *base,
+                                            const uint64_t umask[GFX_IMG_MASK_WORDS],
+                                            const uint64_t smask[GFX_IMG_MASK_WORDS]) {
+    if (!base || !img_masks_any(umask, smask)) return base;
+    uint8_t key[32];
+    variant_key_img(base->key, 3, umask, smask, key);
+    GfxShader *hit = mem_find(key);
+    if (hit) {
+        plat_inc64(&n_hits);
+        return hit;
+    }
+    uint64_t new_n = 0;
+    uint32_t *patched = spirv_int_images(base->spirv, base->words, umask, smask, &new_n);
+    if (!patched) {
+        new_n = base->words;
+        patched = malloc((size_t)new_n * 4u);
+        if (!patched) return base;
+        memcpy(patched, base->spirv, (size_t)new_n * 4u);
+    }
+    GfxShader *s = malloc(sizeof *s);
+    if (!s) {
+        free(patched);
+        return base;
+    }
+    *s = *base;
+    s->next = NULL;
+    memcpy(s->key, key, sizeof s->key);
+    s->spirv = patched;
+    s->words = new_n;
+    s->variant_of = (uint64_t)(uintptr_t)base;
+    for (int k = 0; k < GFX_RES_KINDS; k++) s->res[k] = NULL;
+    s->reflection = NULL;
+    if (base->reflection && base->reflection_size) {
+        s->reflection = malloc(base->reflection_size);
+        if (!s->reflection) {
+            shader_free(s);
+            return base;
+        }
+        memcpy(s->reflection, base->reflection, base->reflection_size);
+    }
+    for (int k = 0; k < GFX_RES_KINDS; k++) {
+        int n = s->nres[k];
+        if (!base->res[k]) continue;
+        s->res[k] = malloc((size_t)(n ? n : 1) * sizeof *s->res[k]);
+        if (!s->res[k]) {
+            shader_free(s);
+            return base;
+        }
+        memcpy(s->res[k], base->res[k], (size_t)(n ? n : 1) * sizeof *s->res[k]);
+    }
     return mem_insert(s);
 }
 

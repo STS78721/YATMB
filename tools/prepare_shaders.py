@@ -247,14 +247,17 @@ def main():
 
     # Auto-detect target executable
     exe = None
-    for name in ('ff.exe', 'dkb.exe', 'mkw.exe', 'mtf.exe', 'totk.exe', 'ff', 'dkb', 'mkw', 'mtf', 'totk'):
+    for name in ('yatmb.exe', 'ff.exe', 'dkb.exe', 'mkw.exe', 'mtf.exe', 'totk.exe',
+                 'yatmb', 'ff', 'dkb', 'mkw', 'mtf', 'totk'):
         cand = out / name
         if cand.is_file():
             exe = cand
             break
     if not exe:
         for p in out.glob('*.exe' if os.name == 'nt' else '*'):
-            if p.is_file() and not p.name.endswith('_xlate.exe') and not p.name.endswith('.id'):
+            low = p.name.lower()
+            if (p.is_file() and not low.endswith('_xlate.exe') and not low.endswith('.id')
+                    and not low.endswith('launcher.exe') and low != 'uninstall.exe'):
                 exe = p
                 break
     if not exe:

@@ -20,13 +20,14 @@ typedef enum {
     UI_MENU_RUMBLE, UI_MENU_RUMBLE_DESC, UI_MENU_RUMBLE_LOW, UI_MENU_RUMBLE_NORMAL, UI_MENU_RUMBLE_STRONG,
     UI_MENU_CONSOLE_MODE_DESC, UI_MENU_FRAME_LIMIT_DESC, UI_MENU_MEMORY_MODE_DESC, UI_MENU_MEMORY_IMPORT_REC,
     UI_MENU_GPU_DESC_RESTART, UI_MENU_HINT_OK, UI_MENU_HINT_BACK, UI_MENU_THEME, UI_MENU_THEME_DESC,
+    UI_MENU_THEME_DESC_STORYBOOK, UI_MENU_THEME_STORYBOOK,
     UI_MENU_THEME_TENNIS, UI_MENU_THEME_LIGHT, UI_MENU_THEME_DARK,
     UI_MENU_CONTINUE, UI_MENU_QUIT,
     UI_MENU_ON, UI_MENU_OFF, UI_MENU_AUTO, UI_MENU_DEFAULT_MARK,      // "default" beside the default value
     UI_MENU_AFTER_RESTART,    // note on a setting that is read at start
     UI_MENU_SET_BY_ENV,       // note on a setting an environment variable fixes
     UI_MENU_SAVE_FAILED,
-    UI_MENU_VERSION,          // "DKB Recomp %s, game %s": the port version and the game update, beside the title
+    UI_MENU_VERSION,          // "PC %s · update %s": the port version and the game update, beside the title
 
     // Screen
     UI_MENU_FULLSCREEN, UI_MENU_FULLSCREEN_DESC,

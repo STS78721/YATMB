@@ -53,7 +53,10 @@ typedef struct Tex {
     struct Tex *image_host;       // pub.image belongs to image_host (a private depth this entry shares)
     int image_shares;             // other entries sampling this private depth image
     uint8_t gpu_dirty;            // mirrored, and the GPU wrote the image after the last write-back to the storage
+    uint32_t gpu_levels;          // bitmask of mip levels written by the GPU (bit lv for lv < 32); ~0u if all levels
     uint32_t gpu_gen;             // page generation when the GPU write that set gpu_dirty was recorded
+    uint32_t cpu_gen;             // page generation before the last upload read storage (baseline for non-GPU levels)
+    uint32_t merge_gen;           // page generation of the last merge_cpu_levels check of a GPU-owned entry
     uint64_t gpu_seq;             // order of that GPU write among all of them (gpu_writes)
     uint64_t gpu_fence;           // fence of the submission that made that write (0: not recorded in one)
     uint64_t wr_fence;            // any entry: newest submission recorded to write its image (render, copy, clear,
@@ -1016,10 +1019,10 @@ static int storage_rewritten(const Tex *e, uint32_t since, uint32_t *now) {
 // 60 frames a minute into play, and the frame rate fell to 8-11 fps (#116). Instead, the storage bytes are hashed just
 // before each upload, and an untracked check uploads again only when the hash differs.
 // Why a match is safe: a match is treated as a clean write-watch answer (ch == 0), which is what the tracked platforms
-// do for a texture whose pages did not change. Most GPU writes into the image (vk_texture_gpu_written, alias_copy)
-// make it GPU-owned for good, so it is never uploaded again. Two writers do not: storage-image stores
-// (tex_info_full in vk_exec_draw.c only calls vk_texture_storage_bound_locked) and the MoltenVK upscaler blit
-// (mvk_upscale_blit). Their results survive an unchanged-storage check exactly as they survive ch == 0 on Windows,
+// do for a texture whose pages did not change. GPU writes into the image (vk_texture_gpu_written, alias_copy, and
+// storage-image stores via vk_texture_storage_bound_locked) make it GPU-owned for good, so it is never uploaded again.
+// Read-only storage image binds and the MoltenVK upscaler blit (mvk_upscale_blit) do not mark GPU-owned; their results
+// survive an unchanged-storage check exactly as they survive ch == 0 on Windows,
 // where the old macOS path wiped them on every submission. The hash is taken before the copy, so a guest write racing
 // the copy leaves the stored hash older than the image and costs one extra upload, never a missed one. The one miss
 // is an ABA: the guest changes a block A to B while it is hashed, the copy reads B, then the guest writes A back, so
@@ -1062,12 +1065,17 @@ static int untracked_same(Tex *e, int ch) {
     return same;
 }
 
+static void merge_cpu_levels(Tex *e, uint32_t epoch);
+static uint64_t n_merged_levels;   // merge_cpu_levels uploads, for the perf line
+
 // A mirrored texture is uploaded on first use and again when its storage pages carry a newer write generation.
 static void make_fresh(Tex *e) {
+    if (e->pub.mirrored && e->pub.gpu_owned) merge_cpu_levels(e, 0);
     if (!e->pub.mirrored || e->pub.gpu_owned) return;
     uint64_t size = e->t.L.size;
     if (!e->uploaded) {
         int ch = vk_mem_changed(e->pub.addr, size, 0, &e->wgen);   // resets the write bits before the storage is read
+        e->cpu_gen = e->wgen;
         untracked_same(e, ch);   // takes the hash for the next untracked check
         upload(e);
         return;
@@ -1075,6 +1083,7 @@ static void make_fresh(Tex *e) {
     uint32_t now;
     int ch = vk_mem_changed(e->pub.addr, size, e->wgen, &now);
     e->wgen = now;
+    e->cpu_gen = now;
     e->last_ch = ch;
     if (ch && !untracked_same(e, ch)) upload(e);   // 1 written, -1 not tracked and the bytes changed: upload again
 }
@@ -1083,11 +1092,13 @@ static void make_fresh(Tex *e) {
 // vk_mem_changed_snap) instead of a system call per texture. A write the snapshot of the texture's region missed (made
 // after it, during this replay) keeps its write-watch bit and is caught by the next submission's snapshot.
 static void make_fresh_snap(Tex *e) {
+    if (e->pub.mirrored && e->pub.gpu_owned) merge_cpu_levels(e, submit_epoch);
     if (!e->pub.mirrored || e->pub.gpu_owned) return;
     uint32_t now;
     n_checks++;
     int ch = vk_mem_changed_snap(e->pub.addr, e->t.L.size, e->uploaded ? e->wgen : 0, submit_epoch, &now);
     e->wgen = now;
+    e->cpu_gen = now;
     if (!e->uploaded) { untracked_same(e, ch); upload(e); return; }
     e->last_ch = ch;
     if (ch && !untracked_same(e, ch)) upload(e);
@@ -1128,8 +1139,8 @@ static int alias_compatible(const Tex *e, const Tex *src) {
 static int alias_has_gpu_content(const Tex *src) {
     if (!src->pub.gpu_owned) return 0;
     if (!src->pub.mirrored) return 1;
-    uint32_t now;
-    return src->gpu_dirty && !storage_rewritten(src, src->gpu_gen, &now);
+    uint32_t now, since = src->merge_gen > src->gpu_gen ? src->merge_gen : src->gpu_gen;
+    return src->gpu_dirty && !storage_rewritten(src, since, &now);
 }
 
 // Maxwell reads the same bytes through both descriptors: src's content goes into the new image e at the replay's
@@ -1288,6 +1299,8 @@ static Tex *entry_of(const tex_t *t) {
                     vk_mem_changed(e->pub.addr, e->t.L.size, 0, &e->wgen);
                     e->uploaded = 1;
                     e->pub.gpu_owned = 1;
+                    e->gpu_levels = src->gpu_levels ? src->gpu_levels : ~0u;
+                    e->gpu_gen = e->cpu_gen = e->merge_gen = e->wgen;
                 }
             } else {
                 init_image(e, vk_upload_begin());
@@ -1304,7 +1317,22 @@ static Tex *entry_of(const tex_t *t) {
         nvn_hm_put(&by_key, &k, e);
         tex_gen_bump(k.addr);
     }
-    if (e->released) e->released = 0, nreleased--, rel_unlink(e), tex_gen_bump(k.addr);
+    if (e->released) {
+        e->released = 0, nreleased--, rel_unlink(e), tex_gen_bump(k.addr);
+        if (e->pub.mirrored && e->pub.gpu_owned) {
+            uint32_t now, since = e->merge_gen > e->gpu_gen ? e->merge_gen : e->gpu_gen;
+            if (storage_rewritten(e, since, &now) == 1) {
+                // Storage was overwritten by CPU while finalized: old GPU content is dead.
+                own_remove(e);
+                e->pub.gpu_owned = 0;
+                e->gpu_levels = 0;
+                e->gpu_dirty = 0;
+                e->uploaded = 0;
+                e->hashed = 0;
+                e->wgen = e->cpu_gen = e->merge_gen = 0;
+            }
+        }
+    }
     e->t = *t;
     return e;
 }
@@ -1348,7 +1376,7 @@ static void wb_cfg_init(void) {
     if (wb_limit != WB_SMALL_DEFAULT) rt_log("vk: fence write-back limit %llu bytes", (unsigned long long)wb_limit);
 }
 
-void vk_texture_gpu_written(const tex_t *t) {
+static void gpu_written_levels(const tex_t *t, uint32_t level_mask) {
     if (!t || !t->mem) return;
     vk_exec_frame_written(t);
     lock();
@@ -1356,6 +1384,7 @@ void vk_texture_gpu_written(const tex_t *t) {
     if (e) {
         make_fresh(e);   // a partial render keeps what the storage held before
         e->pub.gpu_owned = 1;
+        e->gpu_levels |= level_mask;
         uint64_t f = vk_exec_recording_fence();
         if (f > e->wr_fence) e->wr_fence = f;
         if (e->pub.mirrored) {
@@ -1373,6 +1402,12 @@ void vk_texture_gpu_written(const tex_t *t) {
         }
     }
     unlock();
+}
+
+void vk_texture_gpu_written(const tex_t *t) { gpu_written_levels(t, ~0u); }
+
+void vk_texture_gpu_written_level(const tex_t *t, uint32_t level) {
+    gpu_written_levels(t, level < 32 ? (1u << level) : ~0u);
 }
 
 void vk_texture_release(const tex_t *t) {
@@ -1565,6 +1600,74 @@ const VkTexImage *vk_texture_by_id_locked(const dpool_ref *pool, int id, view_t 
     return e ? &e->pub : NULL;
 }
 
+static VkFormat texel_buf_rgb_format(int nvn_fmt) {
+    switch (nvn_fmt) {
+    case NVN_FORMAT_RGB8: return VK_FORMAT_R8G8B8_UNORM;
+    case NVN_FORMAT_RGB8SN: return VK_FORMAT_R8G8B8_SNORM;
+    case NVN_FORMAT_RGB8UI: return VK_FORMAT_R8G8B8_UINT;
+    case NVN_FORMAT_RGB8I: return VK_FORMAT_R8G8B8_SINT;
+    case NVN_FORMAT_RGB16F: return VK_FORMAT_R16G16B16_SFLOAT;
+    case NVN_FORMAT_RGB16: return VK_FORMAT_R16G16B16_UNORM;
+    case NVN_FORMAT_RGB16SN: return VK_FORMAT_R16G16B16_SNORM;
+    case NVN_FORMAT_RGB16UI: return VK_FORMAT_R16G16B16_UINT;
+    case NVN_FORMAT_RGB16I: return VK_FORMAT_R16G16B16_SINT;
+    case NVN_FORMAT_RGB32F: return VK_FORMAT_R32G32B32_SFLOAT;
+    case NVN_FORMAT_RGB32UI: return VK_FORMAT_R32G32B32_UINT;
+    case NVN_FORMAT_RGB32I: return VK_FORMAT_R32G32B32_SINT;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
+// Resolves a buffer texture descriptor slot (NVN_TEXTURE_TARGET_BUFFER). Caller holds tex_lock.
+int vk_texture_buffer_desc_locked(const dpool_ref *pool, int id, uint64_t *addr, uint64_t *size, VkFormat *vk_fmt,
+                                  uint32_t *bpb, int storage) {
+    DescSlot *d = descriptor_slot(pool, id, 1u << 20, 0);
+    if (!d || d->kind != DESC_TEXTURE) return 0;
+    TexSlot *s = &d->u.tex;
+    if (s->t.d.target != NVN_TEXTURE_TARGET_BUFFER || !s->t.mem) return 0;
+    int nfmt = (s->has_view && s->v.set_format) ? (int)s->v.format : s->t.d.format;
+    TexVkFormat f;
+    if (!tex_vk_format(nfmt, &f) || f.depth || f.stencil || f.astc_bw) return 0;
+    VkFormat fmt = f.expand_rgb ? texel_buf_rgb_format(nfmt) : f.vk;
+    if (fmt == VK_FORMAT_UNDEFINED) return 0;
+    if (storage) {
+        if (fmt == VK_FORMAT_R8G8B8A8_SRGB) fmt = VK_FORMAT_R8G8B8A8_UNORM;
+        else if (fmt == VK_FORMAT_B8G8R8A8_SRGB) fmt = VK_FORMAT_B8G8R8A8_UNORM;
+    }
+    VkCtx *c = vk_ctx();
+    if (!c) return 0;
+    static VkPhysicalDevice buf_feat_phys;
+    static VkFormatFeatureFlags buf_feat[256];
+    static uint8_t buf_feat_have[256];
+    if (buf_feat_phys != c->phys) {
+        memset(buf_feat_have, 0, sizeof buf_feat_have);
+        buf_feat_phys = c->phys;
+    }
+    VkFormatFeatureFlags feats = 0;
+    if ((unsigned)fmt < 256 && buf_feat_have[fmt]) {
+        feats = buf_feat[fmt];
+    } else {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(c->phys, fmt, &fp);
+        feats = fp.bufferFeatures;
+        if ((unsigned)fmt < 256) buf_feat[fmt] = feats, buf_feat_have[fmt] = 1;
+    }
+    VkFormatFeatureFlags need = storage ? VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT
+                                        : VK_FORMAT_FEATURE_UNIFORM_TEXEL_BUFFER_BIT;
+    if ((feats & need) != need) return 0;
+    int bw = 0, bh = 0;
+    uint32_t elem_b = (uint32_t)nvn_fmt_bpb(nfmt, &bw, &bh);
+    if (!elem_b || bw != 1 || bh != 1) return 0;
+    uint64_t bytes = s->t.L.size ? s->t.L.size : (uint64_t)s->t.d.width * elem_b;
+    bytes -= bytes % elem_b;
+    if (!bytes) return 0;
+    if (addr) *addr = (uint64_t)(uintptr_t)s->t.mem;
+    if (size) *size = bytes;
+    if (vk_fmt) *vk_fmt = fmt;
+    if (bpb) *bpb = elem_b;
+    return 1;
+}
+
 // vk_dump: the swizzle selectors of the descriptor registered in slot id; 0 when the slot is empty.
 int vk_texture_slot_swz(const dpool_ref *pool, int id, uint8_t swz[4]) {
     lock();
@@ -1607,6 +1710,10 @@ void vk_texture_new_submit(void) {
         rt_log("perf: frame %llu: released textures kept %d, dropped under VRAM pressure %llu", (unsigned long long)f * 60,
                nreleased, (unsigned long long)n_pressure_drops);
         n_pressure_drops = 0;
+        if (n_merged_levels)
+            rt_log("perf: frame %llu: levels of GPU-owned textures uploaded after CPU writes: %llu",
+                   (unsigned long long)f * 60, (unsigned long long)n_merged_levels);
+        n_merged_levels = 0;
     }
     unlock();
 }
@@ -1752,6 +1859,48 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
     return 1;
 }
 
+// CPU writes into the non-GPU-written levels of a GPU-owned mirrored texture. Streaming textures allocate a larger mip
+// chain, GPU-copy the already-resident tail mips into it (marking those levels in gpu_levels), then CPU-write the newly
+// loaded higher mips into storage. Levels the GPU itself wrote (bit set in gpu_levels) are never overwritten from host
+// storage: their host pages are stale, and once every level is GPU-owned this returns without querying write-watch.
+static void merge_cpu_levels(Tex *e, uint32_t epoch) {
+    const nvn_texdesc *d = &e->t.d;
+    if (e->pub.bound || e->image_host || !e->pub.image || !e->uploaded) return;
+    if (nvn_tex_is_linear(d) || d->target == NVN_TEXTURE_TARGET_3D) return;
+    uint32_t levels = e->pub.levels, layers = e->pub.layers ? e->pub.layers : 1;
+    uint32_t all_levels = levels < 32 ? ((1u << levels) - 1u) : ~0u;
+    if ((e->gpu_levels & all_levels) == all_levels) return;
+    uint32_t base = e->merge_gen > e->cpu_gen ? e->merge_gen : e->cpu_gen;
+    uint32_t now;
+    int ch = epoch ? vk_mem_changed_snap(e->pub.addr, e->t.L.size, base, epoch, &now)
+                   : vk_mem_changed(e->pub.addr, e->t.L.size, base, &now);
+    if (ch != 1) return;
+    e->merge_gen = now;
+    for (uint32_t ly = 0; ly < layers; ly++)
+        for (uint32_t lv = 0; lv < levels; lv++) {
+            if (lv >= 32 || ((e->gpu_levels >> lv) & 1u)) continue;
+            uint64_t lo = (uint64_t)ly * e->t.L.layer_size + nvn_tex_level_offset(d, lv);
+            uint64_t hi = lv + 1 < levels ? (uint64_t)ly * e->t.L.layer_size + nvn_tex_level_offset(d, lv + 1)
+                                          : (uint64_t)(ly + 1) * e->t.L.layer_size;
+            uint64_t clo = (e->pub.addr + lo + 0xfff) & ~0xfffull;
+            uint64_t chi = (e->pub.addr + hi) & ~0xfffull;
+            if (chi <= clo) continue;
+            uint32_t tmp;
+            int lch = epoch ? vk_mem_changed_snap(clo, chi - clo, base, epoch, &tmp)
+                            : vk_mem_changed(clo, chi - clo, base, &tmp);
+            if (lch != 1) continue;
+            view_t v = {.set_levels = 1, .set_layers = 1, .base_level = (uint8_t)lv, .min_layer = (uint16_t)ly};
+            NVNcopyRegion r = {.width = (int)mip(d->width, lv),
+                               .height = d->target == 0 || d->target == 3 ? 1 : (int)mip(d->height, lv), .depth = 1};
+            Region g;
+            if (!region_of(&e->t, &v, &r, 0, 0, &g)) continue;
+            uint8_t *buf = malloc(g.img);
+            if (!buf) rt_fatal("vk: out of memory for a texture level upload");
+            if (storage_texels(&e->t, &g, &r, buf, 0) && image_texels(e, &g, &r, buf, 1)) n_merged_levels++;
+            free(buf);
+        }
+}
+
 static void zero_rows(const Region *g, uint8_t *dst) {
     for (int z = 0; z < g->nz; z++)
         for (size_t y = 0; y < g->hb; y++) memset(dst + (size_t)z * g->img + y * g->row, 0, g->wb);
@@ -1840,6 +1989,9 @@ static void write_back(Tex *e) {
             free(buf);
         }
     e->gpu_dirty = 0;
+    uint32_t now;   // these storage writes hold the image's own content: merge_cpu_levels has nothing to take from them
+    vk_mem_changed(e->pub.addr, e->t.L.size, e->gpu_gen, &now);
+    e->merge_gen = now;
 }
 
 // Mirrored textures overlapping [addr, addr+size) that the GPU wrote since their last write-back.
@@ -1855,12 +2007,26 @@ static int owned_dirty(uint64_t addr, uint64_t size, Tex **hit) {
     return n;
 }
 
-// A storage image may be written by the shaders of the submission being recorded (texture lock held, vk_exec_draw.c
-// tex_info). Its storage is not marked GPU-owned: only the write fence for ReadTexels.
-void vk_texture_storage_bound_locked(const VkTexImage *img) {
+// A storage image may be read or written by the shaders of the submission being recorded (texture lock held,
+// vk_exec_draw.c tex_info_full). Always records the write fence for ReadTexels; when written (ImageStore), marks the
+// image GPU-owned so subsequent page checks never overwrite compute outputs (e.g. HZB, temporal history, auto-exposure,
+// global distance fields) with stale host bytes and aliases/ReadTexels see the GPU content.
+void vk_texture_storage_bound_locked(const VkTexImage *img, int written) {
     Tex *e = (Tex *)img;   // pub is the first member
     uint64_t f = vk_exec_recording_fence();
     if (f > e->wr_fence) e->wr_fence = f;
+    if (!written) return;
+    e->pub.gpu_owned = 1;
+    e->gpu_levels = ~0u;
+    if (e->pub.mirrored) {
+        uint64_t lo = (e->pub.addr + 0xfff) & ~0xfffull, hi = (e->pub.addr + e->t.L.size) & ~0xfffull;
+        if (hi <= lo) lo = e->pub.addr, hi = e->pub.addr + e->t.L.size;
+        vk_mem_changed_snap(lo, hi - lo, 0, submit_epoch, &e->gpu_gen);
+        e->gpu_dirty = 1;
+        e->gpu_seq = ++gpu_writes;
+        e->gpu_fence = f;
+        own_add(e);
+    }
 }
 
 uint64_t vk_texture_last_write(const tex_t *t) {
@@ -1911,8 +2077,8 @@ void vk_texture_write_back(uint64_t addr, uint64_t size) {
     if (!hit) rt_fatal("vk: out of memory for a texture write-back");
     int n = owned_dirty(addr, size, hit), k = 0;   // owned[] cannot change while tex_lock is held
     for (int i = 0; i < n; i++) {
-        uint32_t now;
-        if (storage_rewritten(hit[i], hit[i]->gpu_gen, &now) == 1) hit[i]->gpu_dirty = 0;
+        uint32_t now, since = hit[i]->merge_gen > hit[i]->gpu_gen ? hit[i]->merge_gen : hit[i]->gpu_gen;
+        if (storage_rewritten(hit[i], since, &now) == 1) hit[i]->gpu_dirty = 0;
         else hit[k++] = hit[i];
     }
     for (int i = 1; i < k; i++)
@@ -1983,8 +2149,8 @@ void vk_texture_write_back_small(uint64_t fence) {
     if (later) __atomic_store_n(&small_pending, 1, __ATOMIC_RELEASE);
     int k = 0;
     for (int i = 0; i < n; i++) {
-        uint32_t now;
-        if (storage_rewritten(hit[i], hit[i]->gpu_gen, &now) == 1) hit[i]->gpu_dirty = 0;
+        uint32_t now, since = hit[i]->merge_gen > hit[i]->gpu_gen ? hit[i]->merge_gen : hit[i]->gpu_gen;
+        if (storage_rewritten(hit[i], since, &now) == 1) hit[i]->gpu_dirty = 0;
         else hit[k++] = hit[i];
     }
     for (int i = 1; i < k; i++)
