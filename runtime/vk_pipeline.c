@@ -1415,13 +1415,15 @@ static uint32_t *spv_override(const uint32_t *w, uint64_t words, uint64_t *out_w
     return NULL;
 }
 
-// DKB_FMZ=0|vertex|all (default all; workaround for #75): NVIDIA's fused-multiply-zero rule (the DX9 rule, 0 * x = 0
-// even for Inf and NaN) for 32-bit float scalar and vector OpFMul and GLSL.std.450 Fma. Each such instruction
+// DKB_FMZ=0|vertex|graphics|all (default graphics; workaround for #75): NVIDIA's fused-multiply-zero rule (the DX9
+// rule, 0 * x = 0 even for Inf and NaN) for 32-bit float scalar and vector OpFMul and GLSL.std.450 Fma. Each such
+// instruction
 //   r = a * b       becomes   t = a * b;     r = (a == 0 || b == 0) ? 0 : t
 //   r = fma(a,b,c)  becomes   t = fma(a,b,c); r = (a == 0 || b == 0) ? c : t
-// and keeps its original result id r, so decorations and uses stay valid. Only modules of the chosen stage (vertex, or
-// every stage) are rewritten. NULL when nothing is rewritten.
-static uint32_t *spirv_fmz(const uint32_t *w, uint64_t n, int vertex_only, uint64_t *out_n, unsigned *n_mul, unsigned *n_fma) {
+// and keeps its original result id r, so decorations and uses stay valid. Mode 1 = vertex only, 2 = graphics stages
+// (vertex/tess/geometry/fragment; skips GLCompute execution model 5 so huge compute shaders don't stall AMD LLPC),
+// 3 = every stage. NULL when nothing is rewritten.
+static uint32_t *spirv_fmz(const uint32_t *w, uint64_t n, int mode, uint64_t *out_n, unsigned *n_mul, unsigned *n_fma) {
     enum { OP_EXT_INST_IMPORT = 11, OP_EXT_INST = 12, OP_TYPE_BOOL = 20, OP_FMUL = 133, OP_FORD_EQUAL = 180,
            OP_LOGICAL_OR = 166, OP_SELECT = 169, EXT_FMA = 50 };
     if (n < 5) return NULL;
@@ -1447,7 +1449,7 @@ static uint32_t *spirv_fmz(const uint32_t *w, uint64_t n, int vertex_only, uint6
         else if (op == SPV_OP_CONSTANT_NULL && len == 3 && a[0] < bound) nullc[a[0]] = a[1];
         else if (op == SPV_OP_FUNCTION) {
             if (!fn_at) fn_at = i;
-            if (model == ~0u || (vertex_only && model != 0)) { ok = 0; break; }
+            if (model == ~0u || (mode == 1 && model != 0) || (mode == 2 && model == 5)) { ok = 0; break; }
         } else if ((op == OP_FMUL && len == 5) || (op == OP_EXT_INST && len == 8 && glsl && a[2] == glsl && a[3] == EXT_FMA)) {
             if (a[0] < bound && f32[a[0]]) {
                 need[a[0]] = 1, need_bool[comps[a[0]]] = 1;
@@ -1510,12 +1512,14 @@ static VkShaderModule make_module_linked(const GfxShader *src, const uint32_t *w
         w = fixed;
         words = layer_n;
     }
-    static int fmz_mode = -1;   // 0 off, 1 vertex stage only, 2 every stage
+    static int fmz_mode = -1;   // 0 off, 1 vertex only, 2 graphics (skip compute), 3 every stage
     if (fmz_mode < 0) {
         const char *e = cfg_get("TOTK_FMZ");
-        // On by default for all stages (#75 vertex NaN device loss; fragment normalize(0)/fma(0, Inf, base) black albedo).
-        fmz_mode = !e ? 2 : !strcmp(e, "0") || !*e ? 0 : !strcmp(e, "vertex") ? 1 : !strcmp(e, "all") ? 2 : 2;
-        if (e && *e && strcmp(e, "0") && strcmp(e, "vertex") && strcmp(e, "all")) rt_log("vk: DKB_FMZ=%s ignored, using all (use 0, vertex or all)", e);
+        // Default graphics (#75 vertex NaN device loss + fragment normalize(0)/fma(0, Inf, base) black albedo,
+        // while keeping compute shaders compact for fast AMD LLPC compilation).
+        fmz_mode = !e ? 2 : !strcmp(e, "0") || !*e ? 0 : !strcmp(e, "vertex") ? 1 : !strcmp(e, "graphics") ? 2 : !strcmp(e, "all") ? 3 : 2;
+        if (e && *e && strcmp(e, "0") && strcmp(e, "vertex") && strcmp(e, "graphics") && strcmp(e, "all"))
+            rt_log("vk: DKB_FMZ=%s ignored, using graphics (use 0, vertex, graphics or all)", e);
     }
     // DKB_FMZ_SEL=<mask>:<value> (hex, bisection aid for #75): only modules whose FNV-1a 64 hash before the rewrite
     // satisfies (hash & mask) == value get the FMZ rewrite, so a run can cover a fixed half, quarter, ... of them.
@@ -1538,7 +1542,7 @@ static VkShaderModule make_module_linked(const GfxShader *src, const uint32_t *w
     if (fmz_mode && (!fmz_sel_mask || (pre_h & fmz_sel_mask) == fmz_sel_val)) {
         uint64_t fmz_n = 0;
         unsigned nm = 0, nf = 0;
-        fmz = spirv_fmz(w, words, fmz_mode == 1, &fmz_n, &nm, &nf);
+        fmz = spirv_fmz(w, words, fmz_mode, &fmz_n, &nm, &nf);
         if (fmz) {
             w = fmz, words = fmz_n;
             uint64_t h = 0xcbf29ce484222325ull;
@@ -4018,17 +4022,31 @@ VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
     Pipe *p = pipe_find(&k, sizeof k, h);
     if (p) {
         P.stats.hits++;
+        const VkPipeInfo *pi = &p->info;
+        VkPipeline ret = p->info.pipeline;
+        plat_mutex_unlock(&P.lock);
+        if (info) *info = pi;
+        return ret;
+    }
+    const char *why = NULL;
+    Bindings B = {0};
+    Layout *l = compute_layout(cs, &B, &why);
+    // Drop P.lock while the Vulkan driver compiles the compute pipeline (P.cache is driver-synchronised and Layout
+    // entries live until shutdown) so autosave_once() and background pipeline workers never stall during long compiles.
+    plat_mutex_unlock(&P.lock);
+    VkPipeline pipe = VK_NULL_HANDLE;
+    if (!why) {
+        uint64_t p0 = perf_begin();
+        pipe = compute_create(cs, l);
+        perf_end(PERF_PIPE, p0);
+        if (!pipe) why = "pipeline creation failed";
+    }
+    plat_mutex_lock(&P.lock);
+    p = pipe_find(&k, sizeof k, h);
+    if (p) {
+        if (pipe) vkDestroyPipeline(P.device, pipe, NULL);
+        P.stats.hits++;
     } else {
-        const char *why = NULL;
-        Bindings B = {0};
-        Layout *l = compute_layout(cs, &B, &why);
-        VkPipeline pipe = VK_NULL_HANDLE;
-        if (!why) {
-            uint64_t p0 = perf_begin();
-            pipe = compute_create(cs, l);
-            perf_end(PERF_PIPE, p0);
-            if (!pipe) why = "pipeline creation failed";
-        }
         if (why) {
             P.stats.failures++;
             rt_log("vk_pipeline: compute pipeline not built: %s", why);
@@ -4038,10 +4056,11 @@ VkPipeline vk_pipeline_compute(const GfxShader *cs, const VkPipeInfo **info) {
         }
         p = pipe_add(&k, sizeof k, h, pipe, l, l ? &B : NULL, VK_PIPELINE_BIND_POINT_COMPUTE, 0);
     }
+    const VkPipeInfo *pi = p ? &p->info : NULL;
+    VkPipeline ret = p ? p->info.pipeline : VK_NULL_HANDLE;
     plat_mutex_unlock(&P.lock);
-    if (!p) return VK_NULL_HANDLE;
-    if (info) *info = &p->info;
-    return p->info.pipeline;
+    if (info) *info = pi;
+    return ret;
 }
 
 static void lb_lock(void) {

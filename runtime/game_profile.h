@@ -19,6 +19,7 @@ enum {
     GAME_QUIRK_RTLD_ORDER       = 1u << 6, // Bind default-visibility symbols in load order, as rtld does (loader.c)
     GAME_QUIRK_GRAPHICS_SCALE_ZERO = 1u << 7, // nn::oe::GetCurrentGraphicsScale: 0 is full quality (1.0x), 2 is throttled
     GAME_QUIRK_UE5_CVAR_RES     = 1u << 8, // Drive NS2_RESOLUTION via UE5 console variables (r.SetRes, DynamicRes, ScreenPercentage)
+    GAME_QUIRK_UE5_NO_HANG_DETECTOR = 1u << 9, // Disable UE5 FThreadHeartBeat watchdog (prevents 25s false kills during PC shader compile)
 };
 
 typedef struct {

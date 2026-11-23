@@ -43,7 +43,7 @@ from yatmb_dump import (
 
 APP_TITLE = "SteelTemple YATMB"
 APP_SUBTITLE = "Yoshi and the Mysterious Book  ·  Native Windows PC Recompilation"
-DEFAULT_VERSION = "0.1.0"
+DEFAULT_VERSION = "0.1.1"
 GITHUB_URL = "https://github.com/STS78721/YATMB"
 RELEASES_URL = GITHUB_URL + "/releases"
 RELEASES_API_URL = "https://api.github.com/repos/STS78721/YATMB/releases/latest"

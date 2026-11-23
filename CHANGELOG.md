@@ -1,5 +1,18 @@
 ﻿# Changelog
 
+## SteelTemple YATMB 0.1.1 — Stability & AMD Hotfix
+
+Hotfix resolving reproducible first-boot crashes (`access violation writing address 0x3`) on AMD integrated/discrete GPUs and slower systems during initial shader compilation.
+
+■ Fixes & Improvements
+
+- **Fixed First-Boot Hang Detector Crash (`0xc0000005` writing `0x3`):** Disabled Unreal Engine 5's console thread hang watchdog (`FThreadHeartBeat`) on PC builds so cold shader translation and pipeline compilation on AMD GPUs, integrated graphics (e.g. Radeon 890M), and handhelds never trigger false 25-second crash kills during startup or shader pre-warming.
+- **Faster Compute Shader Compilation on AMD (Graphics-Only `.FMZ` Default):** Scoped fused-multiply-zero (`FMZ`) SPIR-V rewriting to graphics stages (vertex, tessellation, geometry, and fragment) by default instead of inflating large UE5 compute shaders for AMD's LLPC compiler, preserving all Stage 1 terrain visual fixes while cutting first-run compute pipeline build times.
+- **Removed Pipeline Lock Stalls During Compute Compiles:** Released the global pipeline table mutex while `vkCreateComputePipelines` runs on the driver so background pipeline cache autosaves and worker threads never stall during heavy compute shader builds.
+- **Dynamic Setup Wizard Versioning:** Setup Wizard PE version metadata now tracks the release version (`0.1.1`) automatically.
+
+---
+
 ## SteelTemple YATMB 0.1.0 — Early Release
 
 Initial early public release of **SteelTemple YATMB**, bringing *Yoshi and the Mysterious Book* (`1.0.2`) natively to Windows PC with a dedicated Setup Wizard, **YATMBLauncher**, Vulkan 1.3 renderer, and clean hardware-agnostic default settings.

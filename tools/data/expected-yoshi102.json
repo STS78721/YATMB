@@ -2,10 +2,10 @@
   "_comment": "Yoshi and the Mysterious Book (1.0.2) ExeFS. Hashes only; no game data.",
   "short_name": "yatmb",
   "display_name": "Yoshi and the Mysterious Book",
-  "port_version": "0.1.0",
+  "port_version": "0.1.1",
   "display_version": "1.0.2",
   "title_id": "0400245021D2C000",
-  "wraps": ["f_700049829c", "f_700582d83c", "f_7002d7a41c"],
+  "wraps": ["f_700049829c", "f_700582d83c", "f_7002d7a41c", "f_70000a8f40"],
   "exefs_sha256": {
     "main": "47c266ddf156177a411d43d3cbbbff7ea96aaae21a021ef75915598e52a1502f",
     "main.npdm": "95574608f876767c866f698c2bd2777b5eedc5086a3786912a5a7c9ce68ec91d",

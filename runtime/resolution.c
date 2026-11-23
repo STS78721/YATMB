@@ -886,3 +886,28 @@ void __wrap_f_7002d7a41c(Cpu *c) {
         if (orig) orig(c);
     }
 }
+
+// ---- UE5 Thread Hang Detector Guard (GAME_QUIRK_UE5_NO_HANG_DETECTOR)
+// UE5's console FThreadHeartBeat::Run() (f_70000a8f40) polls every 0.5 s and intentionally faults
+// (*(uint32_t *)0x3 = 0xe0000001) if any monitored thread goes > HangDuration (25 s) without a
+// heartbeat. On PC (especially AMD LLPC / iGPUs / handhelds), cold first-run shader translation and
+// pipeline compilation can legitimately stall a single boot frame past 25 s. Returning 0 cleanly
+// exits FHeartBeatThread (matching UE5's -nohangdetector behavior) without tripping false kills.
+extern void __real_f_70000a8f40(Cpu *c) __attribute__((weak));
+
+void __wrap_f_70000a8f40(Cpu *c) {
+    if (game_profile_has(GAME_QUIRK_UE5_NO_HANG_DETECTOR)) {
+        static int logged;
+        if (!logged) {
+            logged = 1;
+            rt_log("ue5: thread hang detector disabled (PC shader compilation safety)");
+        }
+        c->x[0] = 0;
+        return;
+    }
+    if (__real_f_70000a8f40) __real_f_70000a8f40(c);
+    else {
+        GuestFn orig = rt_dispatch_lookup(0x70000a8f40ull);
+        if (orig) orig(c);
+    }
+}

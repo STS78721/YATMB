@@ -395,7 +395,7 @@ def verify_clean_stage(stage: Path) -> None:
     print(f"verify_clean_stage: {file_count} files passed check_content + allowlist rules (zero dev INI/game files).")
 
 
-def compile_setup_stub(work: Path) -> Path:
+def compile_setup_stub(work: Path, ver: str) -> Path:
     sdl_static = MKW_CACHE / "win" / "sdl-static"
     deps = MKW_CACHE / "win" / "deps"
     llvm_bin = MKW_CACHE / "win" / "llvm-mingw" / "bin"
@@ -403,6 +403,11 @@ def compile_setup_stub(work: Path) -> Path:
     windres = llvm_bin / "x86_64-w64-mingw32-windres.exe"
     if not (sdl_static / "lib" / "libSDL3.a").is_file():
         sys.exit(f"Missing static SDL3 at {sdl_static}")
+
+    nums = [int(x) for x in ver.split(".") if x.isdigit()]
+    while len(nums) < 4:
+        nums.append(0)
+    ver_csv = ",".join(str(x) for x in nums[:4])
 
     rc_dir = work / "rc"
     rc_dir.mkdir(parents=True, exist_ok=True)
@@ -414,8 +419,8 @@ def compile_setup_stub(work: Path) -> Path:
         '1 ICON "yatmb.ico"\n'
         '1 24 "yatmb.manifest"\n'
         'VS_VERSION_INFO VERSIONINFO\n'
-        ' FILEVERSION 0,1,0,0\n'
-        ' PRODUCTVERSION 0,1,0,0\n'
+        f' FILEVERSION {ver_csv}\n'
+        f' PRODUCTVERSION {ver_csv}\n'
         ' FILEOS VOS_NT_WINDOWS32\n'
         ' FILETYPE VFT_APP\n'
         'BEGIN\n'
@@ -426,8 +431,8 @@ def compile_setup_stub(work: Path) -> Path:
         '      VALUE "CompanyName", "SteelTemple"\n'
         '      VALUE "FileDescription", "SteelTemple YATMB Setup Wizard"\n'
         '      VALUE "ProductName", "Yoshi and the Mysterious Book PC"\n'
-        '      VALUE "FileVersion", "0.1.0"\n'
-        '      VALUE "ProductVersion", "0.1.0"\n'
+        f'      VALUE "FileVersion", "{ver}"\n'
+        f'      VALUE "ProductVersion", "{ver}"\n'
         '    END\n'
         '  END\n'
         '  BLOCK "VarFileInfo"\n'
@@ -565,7 +570,7 @@ def main() -> None:
     stage_sources_and_runtime_lib(stage, llvm, args.gen.resolve(), work / "libbuild", ver)
     verify_clean_stage(stage)
 
-    stub = compile_setup_stub(work / "stubbuild")
+    stub = compile_setup_stub(work / "stubbuild", ver)
     setup_exe = out_dir / f"SteelTemple-YATMB-{slug}-Full-Setup-Wizard.exe"
     pack_setup_with_py314(py314, stub, stage, setup_exe, ver, args.level)
     setup_sha = hashlib.sha256(setup_exe.read_bytes()).hexdigest()
