@@ -34,6 +34,9 @@ stick_deadzone = 8
 volume = 100
 
 [language]
+# Optional override (leave unset for automatic Windows language detection)
+# Supported: en-US, en-GB, ja, fr, fr-CA, de, it, es, es-419, nl, pt-BR, ko, zh-Hans, zh-Hant
+# lang = en-US
 menu_theme = storybook
 
 [performance]

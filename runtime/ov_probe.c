@@ -14,6 +14,7 @@
 
 #include "cfg.h"
 #include "fs.h"
+#include "game_profile.h"
 #include "gfx.h"
 #include "host.h"
 #include "input.h"
@@ -246,10 +247,13 @@ static void set_env(const char *name, const char *value) { plat_setenv(name, val
 static void probe_oe(void) {
     char *keep_lang = cfg_get("TOTK_LANG") ? strdup(cfg_get("TOTK_LANG")) : NULL;
     char *keep_locale = cfg_get("TOTK_LOCALE") ? strdup(cfg_get("TOTK_LOCALE")) : NULL;
-    static const struct { const char *lang, *locale, *want; } cases[] = {
+    const char *want_ru = game_profile_has(GAME_QUIRK_NO_RU) ? "en-US" : "ru";
+    const char *want_pt = game_profile_has(GAME_QUIRK_PT_BR) ? "pt-BR" : "pt";
+    const struct { const char *lang, *locale, *want; } cases[] = {
         {NULL, "en-US", "en-US"}, {NULL, "be-BY", "en-US"}, {NULL, "xx", "en-US"},     {NULL, "ja-JP", "ja"},
         {NULL, "fr-CA", "fr-CA"}, {NULL, "es-MX", "es-419"}, {NULL, "es_ES", "es"},     {NULL, "zh-Hant-TW", "zh-Hant"},
-        {NULL, "zh-CN", "zh-Hans"}, {NULL, "en-GB", "en-GB"}, {NULL, "ru", "ru"},       {"ja", "fr-FR", "ja"},
+        {NULL, "zh-CN", "zh-Hans"}, {NULL, "en-GB", "en-GB"}, {NULL, "ru", want_ru},   {NULL, "pt-BR", want_pt},
+        {NULL, "pt-PT", want_pt}, {"pt", NULL, want_pt},      {"ja", "fr-FR", "ja"},
         {"en-US", NULL, "en-US"}, {"zh-CN", NULL, "zh-Hans"}, {"zh-TW", NULL, "zh-Hant"},
         {"zh-Hans", NULL, "zh-Hans"}, {"zh-Hant", NULL, "zh-Hant"}};
     int bad = 0;

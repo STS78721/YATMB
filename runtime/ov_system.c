@@ -99,7 +99,8 @@ const char *ov_language(void) {
     static const char *const codes[] = {"ja", "en-US", "fr", "de", "it", "es", "ko", "nl", "pt", "ru",
                                         "en-GB", "fr-CA", "es-419", "zh-Hans", "zh-Hant", "pt-BR"};
     const char *code = cfg_get("TOTK_LANG");   // no fixed default: TOTK_LOCALE or the Windows user locale decides when unset
-    if (code && *code) {
+    if (code && *code && strcasecmp(code, "auto") != 0) {
+        if (!strcmp(code, "pt") && game_profile_has(GAME_QUIRK_PT_BR)) return "pt-BR";
         if (!strcmp(code, "ru") && game_profile_has(GAME_QUIRK_NO_RU)) {
             static int logged;
             if (!logged) { logged = 1; rt_log("oe: language 'ru' is unsupported by this title; falling back to 'en-US'"); }
@@ -129,6 +130,15 @@ const char *ov_language(void) {
 // LanguageCode GetDesiredLanguage(): char[8] in x0
 static void ov_desired_language(Cpu *c) {
     const char *code = ov_language();
+    static int logged;
+    if (!logged) {
+        logged = 1;
+        const char *cfg_lang = cfg_get("TOTK_LANG");
+        const char *cfg_loc = cfg_get("TOTK_LOCALE");
+        const char *sys_loc = plat_user_locale();
+        rt_log("oe: desired language '%s' (lang='%s', locale='%s', sys='%s')",
+               code, cfg_lang ? cfg_lang : "", cfg_loc ? cfg_loc : "", sys_loc ? sys_loc : "");
+    }
     uint64_t v = 0;
     memcpy(&v, code, strlen(code));
     ret_x(c, v);

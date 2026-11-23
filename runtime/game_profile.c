@@ -16,7 +16,7 @@ static const RtGameProfile kProfiles[] = {
     {0x040041E0212AE000ull, "ff",   "Fast Fusion",                        "ff.ini",   "dark",      1920, 1080, 1280, 720, GAME_QUIRK_NONE},
     {0x0100F2C0115B6000ull, "totk", "Zelda: Tears of the Kingdom",        "totk.ini", "dark",      1920, 1080, 1280, 720, GAME_QUIRK_TOTK_PATCH_RES},
     {0x0400486024DEC000ull, "oot",  "Zelda: Ocarina of Time (Switch 2)",  "oot.ini",  "dark",      1920, 1080, 1280, 720, GAME_QUIRK_NONE},
-    {0x0400245021D2C000ull, "yatmb","Yoshi and the Mysterious Book",      "yatmb.ini","storybook", 1920, 1080, 1280, 720, GAME_QUIRK_RTLD_ORDER | GAME_QUIRK_GRAPHICS_SCALE_ZERO | GAME_QUIRK_UE5_CVAR_RES | GAME_QUIRK_UE5_NO_HANG_DETECTOR},
+    {0x0400245021D2C000ull, "yatmb","Yoshi and the Mysterious Book",      "yatmb.ini","storybook", 1920, 1080, 1280, 720, GAME_QUIRK_PT_BR | GAME_QUIRK_NO_RU | GAME_QUIRK_RTLD_ORDER | GAME_QUIRK_GRAPHICS_SCALE_ZERO | GAME_QUIRK_UE5_CVAR_RES | GAME_QUIRK_UE5_NO_HANG_DETECTOR},
 };
 
 static RtGameProfile g_resolved;

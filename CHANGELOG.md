@@ -1,5 +1,17 @@
 ﻿# Changelog
 
+## SteelTemple YATMB 0.1.2 — Language & Locale Hotfix
+
+Hotfix preventing unexpected Japanese fallback on Russian and Portuguese Windows locales, and adding a Game Language selector to **YATMBLauncher** and the in-game `F1` menu.
+
+■ Fixes & Improvements
+
+- **Fixed Unexpected Japanese Fallback on Russian & Portuguese Windows Systems:** *Yoshi and the Mysterious Book* (`1.0.2`) ships 14 locales (excluding Russian `ru` and plain European Portuguese `pt`) and defaults to Japanese (`ja`) whenever the OS returns an unsupported language code. The `yatmb` profile now automatically maps Russian locales to English (`en-US`) and maps all Portuguese locales (`pt-BR`, `pt-PT`, and explicit `lang = pt`) to Brazilian Portuguese (`pt-BR`).
+- **Game Language Selector in YATMBLauncher & F1 Menu:** Added a **Game Language** dropdown (`auto` + all 14 supported game languages) to **YATMBLauncher** → **Graphics & Input**, added **Português (Brasil)** (`pt-BR`) to the in-game `F1` → **System** → **Game language** list, and hid unsupported `Русский` from the in-game selector.
+- **Startup Language Diagnostics:** Logs the resolved game language and detected system locale once on startup (`oe: desired language ...`) for easier troubleshooting, and treats explicit `lang = auto` in `yatmb.ini` cleanly as automatic detection.
+
+---
+
 ## SteelTemple YATMB 0.1.1 — Stability & AMD Hotfix
 
 Hotfix resolving reproducible first-boot crashes (`access violation writing address 0x3`) on AMD integrated/discrete GPUs and slower systems during initial shader compilation.

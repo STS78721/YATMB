@@ -43,7 +43,7 @@ from yatmb_dump import (
 
 APP_TITLE = "SteelTemple YATMB"
 APP_SUBTITLE = "Yoshi and the Mysterious Book  ·  Native Windows PC Recompilation"
-DEFAULT_VERSION = "0.1.1"
+DEFAULT_VERSION = "0.1.2"
 GITHUB_URL = "https://github.com/STS78721/YATMB"
 RELEASES_URL = GITHUB_URL + "/releases"
 RELEASES_API_URL = "https://api.github.com/repos/STS78721/YATMB/releases/latest"
@@ -707,6 +707,7 @@ INI_SECTIONS: list[tuple[str, set[str]]] = [
     ("frame rate", {"fps_limit"}),
     ("input", {"pad_layout", "stick_deadzone"}),
     ("audio", {"volume"}),
+    ("language", {"lang", "menu_theme"}),
     ("performance", {"pipe_skip", "pipe_prebuild"}),
 ]
 
@@ -718,6 +719,17 @@ def save_ini_settings(path: Path, updates: dict[str, str]) -> None:
         k_low = key.casefold()
         sec = next((s for s, keys in INI_SECTIONS if k_low in keys), "")
         replaced = False
+        if not value:
+            # Remove key when reset to automatic/unset so clean auto detection runs
+            new_lines: list[str] = []
+            for line in lines:
+                s = line.strip()
+                if not s.startswith(("#", ";", "[")) and "=" in line:
+                    if line.split("=", 1)[0].strip().casefold() == k_low:
+                        continue
+                new_lines.append(line)
+            lines = new_lines
+            continue
         if sec:
             active = ""
             for i, line in enumerate(lines):
@@ -778,6 +790,7 @@ def clean_default_settings() -> dict[str, str]:
         "pad_layout": "auto",
         "stick_deadzone": "8",
         "volume": "100",
+        "lang": "auto",
         "pipe_skip": "any",
         "pipe_prebuild": "1",
     }
@@ -999,7 +1012,8 @@ class YATMBLauncherApp(tk.Tk):
         defaults = clean_default_settings()
         ini = parse_ini(self._ini_path())
         for k, d in defaults.items():
-            self.vars[k].set(ini.get(k, d))
+            val = ini.get(k, d)
+            self.vars[k].set(val if val else d)
 
     def _build_layout(self) -> None:
         # Top Storybook Meadow banner
@@ -1513,6 +1527,13 @@ class YATMBLauncherApp(tk.Tk):
         self._combo_row(right, "Perf Overlay", "perf_overlay", ["off", "fps", "full"])
         self._combo_row(right, "Anisotropic Filtering", "aniso", ["game", "2", "4", "8", "16"])
         self._combo_row(right, "Controller Button Layout", "pad_layout", ["auto", "nintendo", "xbox", "xbox_prompts"])
+        self._combo_row(
+            right,
+            "Game Language",
+            "lang",
+            ["auto", "en-US", "en-GB", "ja", "fr", "fr-CA", "de", "it", "es", "es-419", "nl", "pt-BR", "ko", "zh-Hans", "zh-Hant"],
+            hint="auto = Windows locale (Russian -> en-US, Portuguese -> pt-BR).",
+        )
 
         bar = tk.Frame(page, bg=C_PANEL, highlightbackground=C_LINE, highlightthickness=1, padx=16, pady=12)
         bar.pack(fill=tk.X, pady=(12, 0))
@@ -1530,7 +1551,8 @@ class YATMBLauncherApp(tk.Tk):
         cb = ttk.Combobox(top, textvariable=self.vars[key], values=values, state="readonly", style="YATMB.TCombobox", width=18)
         cb.pack(side=tk.RIGHT)
         if hint:
-            tk.Label(wrap, text=hint, font=("Segoe UI", 8), fg=C_TEXT_DIM, bg=C_PANEL).pack(anchor="w")
+            tk.Label(wrap, text=hint, font=("Segoe UI", 8), fg=C_TEXT_DIM, bg=C_PANEL,
+                     wraplength=420, justify="left").pack(anchor="w")
 
     def _build_mods_page(self) -> tk.Frame:
         page = tk.Frame(self.body, bg=C_BG)
@@ -1676,6 +1698,8 @@ class YATMBLauncherApp(tk.Tk):
 
     def on_save_settings(self) -> None:
         updates = {k: self.vars[k].get().strip() for k in clean_default_settings()}
+        if updates.get("lang", "").casefold() == "auto":
+            updates["lang"] = ""
         if updates["resolution"] == "original":
             # Ensure output window size also stays synchronized if left untouched
             updates["window_size"] = updates["output_res"]

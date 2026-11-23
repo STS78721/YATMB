@@ -527,7 +527,7 @@ static void row_game_lang(void) {
     static const struct { const char *code; UiTextId name; } langs[] = {
         {"en-US", UI_MENU_LANGNAME_EN}, {"ja", UI_MENU_LANGNAME_JA}, {"fr", UI_MENU_LANGNAME_FR},
         {"de", UI_MENU_LANGNAME_DE}, {"it", UI_MENU_LANGNAME_IT}, {"es", UI_MENU_LANGNAME_ES},
-        {"nl", UI_MENU_LANGNAME_NL}, {"ru", UI_MENU_LANGNAME_RU},
+        {"nl", UI_MENU_LANGNAME_NL}, {"pt-BR", UI_MENU_LANGNAME_PT_BR}, {"ru", UI_MENU_LANGNAME_RU},
         {"zh-Hans", UI_MENU_LANGNAME_ZH_HANS}, {"zh-Hant", UI_MENU_LANGNAME_ZH_HANT}, {"ko", UI_MENU_LANGNAME_KO},
     };
     enum { N = sizeof langs / sizeof *langs + 1 };
@@ -539,8 +539,10 @@ static void row_game_lang(void) {
     const char *now = cfg_value("NS2_LANG");
     int cur = *now ? -1 : 0;
     int skip_ru = game_profile_has(GAME_QUIRK_NO_RU);
+    int show_pt_br = game_profile_has(GAME_QUIRK_PT_BR);
     for (int i = 0; i < (int)(sizeof langs / sizeof *langs); i++) {
         if (skip_ru && !strcmp(langs[i].code, "ru")) continue;
+        if (!show_pt_br && !strcmp(langs[i].code, "pt-BR")) continue;
         vals[n] = langs[i].code;
         names[n] = menu_text(langs[i].name);
         if (*now && !strcmp(ui_text_lang(now), ui_text_lang(vals[n]))) cur = n;   // en-GB is English too

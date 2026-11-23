@@ -11,7 +11,7 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%7C%2011-0078D6?style=for-the-badge&logo=windows&logoColor=white)](#-requirements)
 [![Vulkan](https://img.shields.io/badge/Vulkan-1.3-AC162C?style=for-the-badge&logo=vulkan&logoColor=white)](#-under-the-hood)
 [![Game version](https://img.shields.io/badge/game-1.0.2-60E244?style=for-the-badge)](#-quick-start)
-[![Release](https://img.shields.io/badge/release-0.1.1%20Hotfix-FFE060?style=for-the-badge&labelColor=0C1E12)](https://github.com/STS78721/YATMB/releases/tag/0.1.1)
+[![Release](https://img.shields.io/badge/release-0.1.2%20Hotfix-FFE060?style=for-the-badge&labelColor=0C1E12)](https://github.com/STS78721/YATMB/releases/tag/0.1.2)
 [![License](https://img.shields.io/badge/license-GPL--3.0%2B-blue?style=for-the-badge)](#-credits--licence)
 
 **[Quick start](#-quick-start)** · **[Features](#-highlights)** · **[Status](#-status)** · **[How it works](#-under-the-hood)** · **[Changelog](CHANGELOG.md)** · **[Credits](#-credits--licence)**
@@ -21,7 +21,7 @@
 ---
 
 > [!WARNING]
-> **Early Release (`0.1.1`):** *Yoshi and the Mysterious Book* is working and playable right now, but this is an **early release** — you may still encounter rendering issues, visual glitches, shader compilation stutters, or performance drops in later chapters and across different GPU/CPU configurations. Updates will continue to polish visuals, stability, and performance.
+> **Early Release (`0.1.2`):** *Yoshi and the Mysterious Book* is working and playable right now, but this is an **early release** — you may still encounter rendering issues, visual glitches, shader compilation stutters, or performance drops in later chapters and across different GPU/CPU configurations. Updates will continue to polish visuals, stability, and performance.
 
 > [!IMPORTANT]
 > **No game files are included.** You need your own legally dumped copy of **Yoshi and the Mysterious Book (1.0.2)** (either a `.nup` container or `ExeFS` and `RomFS` dump folders). This repository contains only the recompiler, runtime, launcher, and setup tools.
@@ -51,7 +51,7 @@ Translates Switch 2 NVN 2 commands and Ampere (`SM86`) shaders to Vulkan 1.3 wit
 Press **F1** or **Esc** (or **Back + Y** on a controller) for a native settings overlay in the **Storybook Meadow** theme (plus Dark and Light themes) with live telemetry and config saving to `yatmb.ini`.
 
 ### 🖥️ Setup Wizard & YATMBLauncher (.nup & direct dumps)
-Install cleanly with **`SteelTemple-YATMB-0.1.1-Full-Setup-Wizard.exe`** or the portable archive: bundled LLVM-MinGW, Ninja, and Python verify your **1.0.2** `.nup` container or `ExeFS`/`RomFS` folders and build `yatmb.exe` locally with no external tools required.
+Install cleanly with **`SteelTemple-YATMB-0.1.2-Full-Setup-Wizard.exe`** or the portable archive: bundled LLVM-MinGW, Ninja, and Python verify your **1.0.2** `.nup` container or `ExeFS`/`RomFS` folders and build `yatmb.exe` locally with no external tools required.
 
 ### 🕹️ Controllers, mods & local save backups
 Supports Xbox, DualSense, Nintendo Switch / Switch 2 Pro controllers, and keyboard out of the box. Includes quick folder access and timestamped save snapshots inside **YATMBLauncher**.
@@ -60,7 +60,7 @@ Supports Xbox, DualSense, Nintendo Switch / Switch 2 Pro controllers, and keyboa
 </tr>
 </table>
 
-## 📊 Status (`0.1.1` Early Release)
+## 📊 Status (`0.1.2` Early Release)
 
 | Area | State |
 |---|---|
@@ -75,8 +75,8 @@ Supports Xbox, DualSense, Nintendo Switch / Switch 2 Pro controllers, and keyboa
 
 **1. Install SteelTemple YATMB**
 
-Download **`0.1.1`** from the **[Releases page](https://github.com/STS78721/YATMB/releases/tag/0.1.1)**:
-- Run **`SteelTemple-YATMB-0.1.1-Full-Setup-Wizard.exe`** (no administrator rights required), or extract **`SteelTemple-YATMB-0.1.1-Portable-StandAlone.zip`**.
+Download **`0.1.2`** from the **[Releases page](https://github.com/STS78721/YATMB/releases/tag/0.1.2)**:
+- Run **`SteelTemple-YATMB-0.1.2-Full-Setup-Wizard.exe`** (no administrator rights required), or extract **`SteelTemple-YATMB-0.1.2-Portable-StandAlone.zip`**.
 
 **2. Set up from your Yoshi and the Mysterious Book 1.0.2 dump**
 
